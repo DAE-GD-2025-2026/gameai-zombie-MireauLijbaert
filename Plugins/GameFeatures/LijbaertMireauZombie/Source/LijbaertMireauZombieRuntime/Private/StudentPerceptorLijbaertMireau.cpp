@@ -3,7 +3,9 @@
 #include "Kismet/GameplayStatics.h"
 #include "Zombies/BaseZombie.h"
 #include "Items/BaseItem.h"
+#include "Items/ItemType.h"
 #include "Village/House/House.h"
+#include "Survivor/SurvivorPawn.h"
 
 UStudentPerceptor::UStudentPerceptor()
 {
@@ -34,44 +36,29 @@ void UStudentPerceptor::ActivateWanderMode()
 void UStudentPerceptor::ActivateNavigationTarget(const FVector& TargetWorldPos)
 {
     bActionFinished = false;
-    
-    APawn* GenericPawn = Cast<APawn>(GetOwner());
-    if (!GenericPawn) return;
-    
-    struct FCalculatePathArgs
-    {
-        FVector TargetLocation;      // Input parameter matching her function signature
-        TArray<FVector> ReturnValue; // Output/Return value matching her function signature
-    };
 
-    FCalculatePathArgs Args;
-    Args.TargetLocation = TargetWorldPos;
+    // Cast directly to SurvivorPawn — CalculatePath is a plain C++ function, not a UFUNCTION,
+    // so reflection (FindFunction/ProcessEvent) can never find it. Direct call is the only option.
+    ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(GetOwner());
+    if (!SurvivorPawn) return;
 
-    // Find the function by its exact text name inside her blueprint/pawn class
-    UFunction* Func = GenericPawn->FindFunction(FName("CalculatePath"));
-    
-    TArray<FVector> UnrealPoints;
-    if (Func)
+    TArray<FVector> UnrealPoints = SurvivorPawn->CalculatePath(TargetWorldPos);
+
+    if (UnrealPoints.Num() == 0)
     {
-        // Execute the function safely on her pawn from the outside
-        GenericPawn->ProcessEvent(Func, &Args);
-        UnrealPoints = Args.ReturnValue;
-    }
-    else
-    {
-        // Fallback: If the reflection lookup fails, just go straight to the target in a straight line
-        UnrealPoints.Add(GenericPawn->GetActorLocation());
+        // NavMesh couldn't find a path — fall back to straight line
+        UE_LOG(LogTemp, Warning, TEXT("StudentPerceptor: CalculatePath returned empty — falling back to straight line"));
+        UnrealPoints.Add(SurvivorPawn->GetActorLocation());
         UnrealPoints.Add(TargetWorldPos);
     }
 
-    // Convert the results to your custom 2D vector path format
+    // Convert to the 2D path format the PathFollow steering behavior expects
     std::vector<FVector2D> CustomPath;
     for (const FVector& Pt : UnrealPoints)
     {
         CustomPath.push_back(FVector2D(Pt.X, Pt.Y));
     }
 
-    // Feed ported PathFollow algorithm
     MyPathFollowBehavior->SetPath(CustomPath);
     CurrentState = EMovementState::PathFollowing;
 }
@@ -95,6 +82,28 @@ AActor* UStudentPerceptor::GetNearestLoot()
 
     for (AActor* Loot : PerceivedLoot)
     {
+        float DistSq = FVector::DistSquared(MyLoc, Loot->GetActorLocation());
+        if (DistSq < NearestDistSq)
+        {
+            NearestDistSq = DistSq;
+            Nearest = Loot;
+        }
+    }
+    return Nearest;
+}
+
+AActor* UStudentPerceptor::GetNearestUsefulLoot()
+{
+    AActor* Nearest = nullptr;
+    float NearestDistSq = MAX_FLT;
+    FVector MyLoc = GetOwner()->GetActorLocation();
+
+    for (AActor* Loot : PerceivedLoot)
+    {
+        if (!Loot) continue;
+        ABaseItem* Item = Cast<ABaseItem>(Loot);
+        if (!Item || Item->GetItemType() == EItemType::Garbage) continue;
+
         float DistSq = FVector::DistSquared(MyLoc, Loot->GetActorLocation());
         if (DistSq < NearestDistSq)
         {

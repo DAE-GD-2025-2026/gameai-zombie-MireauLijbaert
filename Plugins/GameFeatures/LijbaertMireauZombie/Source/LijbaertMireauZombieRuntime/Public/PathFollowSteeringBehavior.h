@@ -19,6 +19,7 @@ private:
 	ISteeringBehavior* pCurrentSteering = nullptr;
 	std::vector<FVector2D> pathVec = {};
 	int currentPathIndex = 0;
+	bool bPathFinished = false; // true once the last waypoint is reached — stops looping
 
 	void GotoNextPathPoint();
 };

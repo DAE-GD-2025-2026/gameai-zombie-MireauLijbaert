@@ -6,6 +6,8 @@
 #include "Navigation/PathFollowingComponent.h"
 #include "Common/InventoryComponent.h"
 #include "Items/BaseItem.h"
+#include "Items/ItemType.h"
+#include "Village/House/House.h"
 
 UBTTask_ExecuteGoapAction::UBTTask_ExecuteGoapAction()
 {
@@ -40,12 +42,13 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
     }
     if (CurrentAction.ActionName == TEXT("Action_SearchHouse"))
     {
-        // Check if we've already spotted a house we can head to
-        AActor* House = Perceptor->GetNearestUnexploredHouse();
-        if (House)
+        AActor* HouseActor = Perceptor->GetNearestUnexploredHouse();
+        if (HouseActor)
         {
-            // We know where a house is — navigate straight to it
-            Perceptor->ActivateNavigationTarget(House->GetActorLocation());
+            // Navigate to the geometric center of the house so we end up inside
+            AHouse* House = Cast<AHouse>(HouseActor);
+            FVector Target = House ? House->GetBounds().Origin : HouseActor->GetActorLocation();
+            Perceptor->ActivateNavigationTarget(Target);
         }
         else
         {
@@ -56,8 +59,15 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
     }
     if (CurrentAction.ActionName == TEXT("Action_PickupLoot"))
     {
-        AActor* Loot = Perceptor->GetNearestLoot();
-        if (!Loot) return EBTNodeResult::Failed;
+        // Navigate to the first useful item we can see (garbage is ignored)
+        AActor* Loot = Perceptor->GetNearestUsefulLoot();
+        if (!Loot)
+        {
+            // House appears empty (or only garbage) — nothing to do here
+            Brain->CompleteCurrentAction();
+            FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+            return EBTNodeResult::Succeeded;
+        }
         Perceptor->ActivateNavigationTarget(Loot->GetActorLocation());
         return EBTNodeResult::InProgress;
     }
@@ -94,10 +104,12 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
             // If we were wandering and just spotted a house, switch to navigation
             if (Perceptor->GetCurrentTargetHouse() == nullptr)
             {
-                AActor* House = Perceptor->GetNearestUnexploredHouse();
-                if (House)
+                AActor* HouseActor = Perceptor->GetNearestUnexploredHouse();
+                if (HouseActor)
                 {
-                    Perceptor->ActivateNavigationTarget(House->GetActorLocation());
+                    AHouse* House = Cast<AHouse>(HouseActor);
+                    FVector Target = House ? House->GetBounds().Origin : HouseActor->GetActorLocation();
+                    Perceptor->ActivateNavigationTarget(Target);
                 }
             }
             return; // Still traveling
@@ -110,35 +122,58 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
         return;
     }
 
-    // --- PickupLoot: navigate to item, then actually grab it ---
+    // --- PickupLoot: navigate to each useful item in the house until none remain or inventory is full ---
     if (CurrentAction.ActionName == TEXT("Action_PickupLoot"))
     {
-        if (!Perceptor->IsCurrentActionFinished()) return; // Still traveling
+        if (!Perceptor->IsCurrentActionFinished()) return; // Still traveling to current item
 
-        // Arrived near the loot — find the inventory and grab the nearest item
         UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
-        AActor* LootActor = Perceptor->GetNearestLoot();
+        AActor* LootActor = Perceptor->GetNearestUsefulLoot();
 
         if (Inv && LootActor)
         {
             ABaseItem* Item = Cast<ABaseItem>(LootActor);
             if (Item)
             {
-                const TArray<ABaseItem*>& InvSlots = Inv->GetInventory();
-                for (int32 i = 0; i < InvSlots.Num(); ++i)
+                // Find the first empty inventory slot and grab the item
+                const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+                bool bInventoryFull = true;
+                for (int32 i = 0; i < Slots.Num(); ++i)
                 {
-                    if (InvSlots[i] == nullptr)
+                    if (Slots[i] == nullptr)
                     {
                         Inv->GrabItem(i, Item);
-                        UE_LOG(LogTemp, Log, TEXT("BTTask: Picked up item '%s' into slot %d"), *Item->GetName(), i);
+                        Perceptor->PerceivedLoot.Remove(LootActor); // We have it now, stop targeting it
+                        UE_LOG(LogTemp, Log, TEXT("BTTask: Grabbed '%s' into slot %d"), *Item->GetName(), i);
+                        bInventoryFull = false;
                         break;
                     }
+                }
+
+                if (bInventoryFull)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("BTTask: Inventory full, leaving remaining loot"));
+                    Brain->CompleteCurrentAction();
+                    FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+                    return;
                 }
             }
         }
 
-        Brain->CompleteCurrentAction();
-        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        // Check if there's still more useful loot in the house
+        AActor* NextLoot = Perceptor->GetNearestUsefulLoot();
+        if (NextLoot)
+        {
+            // Navigate to the next item — TickTask will fire again when we arrive
+            Perceptor->ActivateNavigationTarget(NextLoot->GetActorLocation());
+        }
+        else
+        {
+            // House fully looted (or only garbage left)
+            UE_LOG(LogTemp, Log, TEXT("BTTask: House fully looted, moving on"));
+            Brain->CompleteCurrentAction();
+            FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        }
         return;
     }
 

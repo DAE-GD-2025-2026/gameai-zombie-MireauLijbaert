@@ -64,6 +64,7 @@ public:
 	
 	AActor* GetHighestThreatZombie();
 	AActor* GetNearestLoot();
+	AActor* GetNearestUsefulLoot(); // Nearest non-garbage item
 	AActor* GetNearestUnexploredHouse();
 	void MarkCurrentHouseExplored();
 	AActor* GetCurrentTargetHouse() const { return CurrentTargetHouse; }
