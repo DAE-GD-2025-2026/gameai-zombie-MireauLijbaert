@@ -51,13 +51,12 @@ void UGoapAgentBrain::SetupGoalsAndActions()
 
     // ---Define actions---
     
-    // Action Kiting Combat
+    // Action Kiting Combat — flee always, shoot only if weapon available
     FGoapAction KiteAction;
     KiteAction.ActionName = TEXT("Action_Kiting");
     KiteAction.Cost = 1;
     KiteAction.Preconditions.Add(TEXT("ZombiesNearby"), 1);
-    KiteAction.Preconditions.Add(TEXT("HasWeapon"), 1);
-    KiteAction.Effects.Add(TEXT("ZombiesNearby"), 0); // Fleeing/killing eliminates threat
+    KiteAction.Effects.Add(TEXT("ZombiesNearby"), 0);
     Actions.Add(KiteAction);
 
     // Action Search House
@@ -113,17 +112,27 @@ void UGoapAgentBrain::InitializeAgent(const TArray<FGoapAction>& CustomActions, 
 void UGoapAgentBrain::ProcessHighestPriorityGoal(const TArray<FGoapGoalStrategy>& Strategies)
 {
     if (bIsExecutingAction || Strategies.Num() == 0) return;
-    
-    FGoapGoalStrategy BestStrategy = Strategies[0];
-    for (int32 i = 1; i < Strategies.Num(); ++i)
+
+    FGoapGoalStrategy BestStrategy;
+    bool bFoundGoal = false;
+
+    for (const FGoapGoalStrategy& Strategy : Strategies)
     {
-        if (Strategies[i].DesirabilityScore > BestStrategy.DesirabilityScore)
+        if (Strategy.DesirabilityScore <= 0.f) continue;
+
+        // Skip goals that are already satisfied — no point pursuing them
+        const int32* CurrentValue = CurrentState.Find(Strategy.GoalKey);
+        if (CurrentValue && *CurrentValue == Strategy.TargetValue) continue;
+
+        if (!bFoundGoal || Strategy.DesirabilityScore > BestStrategy.DesirabilityScore)
         {
-            BestStrategy = Strategies[i];
+            BestStrategy = Strategy;
+            bFoundGoal = true;
         }
     }
 
-    // Apply the chosen goal
+    if (!bFoundGoal) return; // Every active goal is already met — stay on current goal
+
     CurrentGoal.Empty();
     CurrentGoal.Add(BestStrategy.GoalKey, BestStrategy.TargetValue);
     VisualCurrentGoalName = BestStrategy.VisualName;
@@ -157,10 +166,45 @@ void UGoapAgentBrain::TickComponent(float DeltaTime, ELevelTick TickType, FActor
     
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
     
-    // If we are actively running an action, pass control off to the AI Controller / Character loop
+    // If we are actively running an action, check if a higher-priority goal has emerged
     if (bIsExecutingAction)
     {
-       return;
+        // Find the best available goal and the desirability of the current goal
+        float BestDesirability = 0.f;
+        FString BestGoalKey;
+        float CurrentGoalDesirability = 0.f;
+        FString CurrentGoalKey;
+
+        for (const auto& Pair : CurrentGoal)
+        {
+            CurrentGoalKey = Pair.Key;
+        }
+
+        for (const FGoapGoalStrategy& G : PossibleGoals)
+        {
+            if (G.DesirabilityScore > BestDesirability)
+            {
+                BestDesirability = G.DesirabilityScore;
+                BestGoalKey = G.GoalKey;
+            }
+            if (G.GoalKey == CurrentGoalKey)
+            {
+                CurrentGoalDesirability = G.DesirabilityScore;
+            }
+        }
+
+        // Interrupt only if a meaningfully better goal exists (5-point threshold avoids flapping)
+        if (!BestGoalKey.IsEmpty() && BestGoalKey != CurrentGoalKey && BestDesirability > CurrentGoalDesirability + 5.f)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("[%s] GOAP Brain: Priority interrupt! '%s'(%.0f) > '%s'(%.0f) — aborting plan"),
+                *GetOwner()->GetName(), *BestGoalKey, BestDesirability, *CurrentGoalKey, CurrentGoalDesirability);
+            AbortCurrentPlan();
+            // Fall through so replanning happens this tick
+        }
+        else
+        {
+            return;
+        }
     }
    
     if (PlanningCooldownTimer > 0.0f)
@@ -300,6 +344,7 @@ void UGoapAgentBrain::CalculateDesirability()
 
     CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
     CurrentState.Add(TEXT("HasMedkit"), bHasMedkit ? 1 : 0);
+    CurrentState.Add(TEXT("IsHealthy"), (CurrentHealth >= 3.0f) ? 1 : 0);
 
     
     for (FGoapGoalStrategy& Strategy : PossibleGoals)
@@ -315,11 +360,10 @@ void UGoapAgentBrain::CalculateDesirability()
         // Dependency for: "Heal Critical Injuries"
         else if (Strategy.GoalKey == TEXT("IsHealthy"))
         {
-            // If our health drops below 30% AND we possess a healing item,
-            // make this the single most important task in existence.
-            if (CurrentHealth < 30.0f && bHasMedkit)
+            // Health is on a 0-10 scale. Trigger healing below 30% of max (i.e. < 3) AND we have a medkit.
+            if (CurrentHealth < 3.0f && bHasMedkit)
             {
-                Strategy.DesirabilityScore = 100.0f; 
+                Strategy.DesirabilityScore = 100.0f;
             }
             else
             {
@@ -330,11 +374,14 @@ void UGoapAgentBrain::CalculateDesirability()
         // Dependency for: "Search Houses for Loot"
         else if (Strategy.GoalKey == TEXT("HasResources"))
         {
-            // Baseline exploration task. If we are completely safe from zombies
-            // and don't need emergency medical care, this stays active.
-            if (!bZombiesDetected && CurrentHealth >= 30.0f)
+            if (!bZombiesDetected && CurrentHealth >= 3.0f)
             {
-                Strategy.DesirabilityScore = 40.0f;
+                Strategy.DesirabilityScore = 40.0f; // Baseline exploration
+            }
+            else if (bZombiesDetected && !bHasWeapon)
+            {
+                // Zombies nearby and no weapon — urgently search for one after fleeing
+                Strategy.DesirabilityScore = 70.0f;
             }
             else
             {

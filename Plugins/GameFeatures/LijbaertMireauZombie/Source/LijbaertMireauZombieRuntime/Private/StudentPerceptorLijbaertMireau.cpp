@@ -1,6 +1,7 @@
 ﻿#include "StudentPerceptorLijbaertMireau.h"
 
 #include "Kismet/GameplayStatics.h"
+#include "NavigationSystem.h"
 #include "Zombies/BaseZombie.h"
 #include "Items/BaseItem.h"
 #include "Items/ItemType.h"
@@ -11,10 +12,14 @@ UStudentPerceptor::UStudentPerceptor()
 {
     PrimaryComponentTick.bCanEverTick = true;
 
-    // Instantiate your ported classes
-    MyWanderBehavior = new Wander();
+    MyWanderBehavior     = new Wander();
+    MyDriftSeek          = new Seek();
+    MyBlendedWander      = new BlendedSteering({
+        { MyWanderBehavior, 0.75f },  // organic wandering
+        { MyDriftSeek,      0.25f }   // gentle drift toward a distant target
+    });
     MyPathFollowBehavior = new PathFollow();
-    MyFleeBehavior = new Flee();
+    MyFleeBehavior       = new Flee();
 }
 
 void UStudentPerceptor::BeginPlay()
@@ -31,6 +36,28 @@ void UStudentPerceptor::ActivateWanderMode()
 {
     bActionFinished = false;
     CurrentState = EMovementState::Wander;
+    PickNewDriftTarget();
+}
+
+void UStudentPerceptor::PickNewDriftTarget()
+{
+    FVector MyLoc = GetOwner()->GetActorLocation();
+    UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(GetWorld());
+    FNavLocation NavResult;
+
+    if (NavSys && NavSys->GetRandomReachablePointInRadius(MyLoc, FMath::RandRange(3000.f, 6000.f), NavResult))
+    {
+        CurrentDriftTarget = FVector2D(NavResult.Location.X, NavResult.Location.Y);
+    }
+    else
+    {
+        // Fallback if NavMesh unavailable
+        float Angle = FMath::RandRange(0.f, 2.f * PI);
+        float Dist  = FMath::RandRange(3000.f, 6000.f);
+        CurrentDriftTarget = FVector2D(MyLoc.X + FMath::Cos(Angle) * Dist,
+                                       MyLoc.Y + FMath::Sin(Angle) * Dist);
+    }
+    UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: New drift target (%.0f, %.0f)"), CurrentDriftTarget.X, CurrentDriftTarget.Y);
 }
 
 void UStudentPerceptor::ActivateRotationSearch()
@@ -137,7 +164,40 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
     
     if (CurrentState == EMovementState::Wander)
     {
-        MathOutput = MyWanderBehavior->CalculateSteering(DeltaTime, Agent);
+        FVector MyLoc = PawnOwner->GetActorLocation();
+        FVector2D MyLoc2D(MyLoc.X, MyLoc.Y);
+
+        // Refresh drift target when we've arrived
+        if (FVector2D::DistSquared(MyLoc2D, CurrentDriftTarget) < 400.f * 400.f)
+        {
+            PickNewDriftTarget();
+            WanderStuckTimer = 0.f;
+        }
+
+        // Stuck detection if barely moving for 1.5s, pathfind to drift target to route around the wall
+        const float SpeedSq = PawnOwner->GetVelocity().SizeSquared2D();
+        if (SpeedSq < 50.f * 50.f)
+        {
+            WanderStuckTimer += DeltaTime;
+            if (WanderStuckTimer >= 1.5f)
+            {
+                WanderStuckTimer = 0.f;
+                UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: Wander stuck — pathfinding around wall to drift target"));
+                FVector DriftTarget3D(CurrentDriftTarget.X, CurrentDriftTarget.Y, MyLoc.Z);
+                ActivateNavigationTarget(DriftTarget3D);
+                return;
+            }
+        }
+        else
+        {
+            WanderStuckTimer = 0.f;
+        }
+
+        FTargetData DriftData;
+        DriftData.Position = CurrentDriftTarget;
+        MyDriftSeek->SetTarget(DriftData);
+
+        MathOutput = MyBlendedWander->CalculateSteering(DeltaTime, Agent);
     }
     else if (CurrentState == EMovementState::PathFollowing)
     {
@@ -172,10 +232,22 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
         AActor* Threat = GetHighestThreatZombie();
         if (Threat)
         {
-            FTargetData T;
-            T.Position = FVector2D(Threat->GetActorLocation().X, Threat->GetActorLocation().Y);
-            T.LinearVelocity = FVector2D(Threat->GetVelocity().X, Threat->GetVelocity().Y);
-            MyFleeBehavior->SetTarget(T);
+            // Stop fleeing once we're a safe distance away — GOAP replans and starts a fresh
+            // flee cycle if the zombie is still perceived, preventing an endless sprint to the
+            // map edge. Tune SafeFleeDistSq to match your perception radius.
+            const float SafeFleeDistSq = 2000.f * 2000.f;
+            if (FVector::DistSquared(GetOwner()->GetActorLocation(), Threat->GetActorLocation()) > SafeFleeDistSq)
+            {
+                bActionFinished = true;
+                CurrentState = EMovementState::None;
+            }
+            else
+            {
+                FTargetData T;
+                T.Position = FVector2D(Threat->GetActorLocation().X, Threat->GetActorLocation().Y);
+                T.LinearVelocity = FVector2D(Threat->GetVelocity().X, Threat->GetVelocity().Y);
+                MyFleeBehavior->SetTarget(T);
+            }
         }
         else
         {
@@ -192,9 +264,13 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
     if (MovementVector.SizeSquared() > 1.f)
     {
         PawnOwner->AddMovementInput(MovementVector.GetSafeNormal(), 1.0f);
-        
-        FRotator TargetRotation = FRotationMatrix::MakeFromX(MovementVector).Rotator();
-        PawnOwner->SetActorRotation(FRotator(0.f, TargetRotation.Yaw, 0.f));
+
+        // Only override rotation if the BT task isn't controlling it externally (e.g. during kiting)
+        if (!bExternalRotationControl)
+        {
+            FRotator TargetRotation = FRotationMatrix::MakeFromX(MovementVector).Rotator();
+            PawnOwner->SetActorRotation(FRotator(0.f, TargetRotation.Yaw, 0.f));
+        }
     }
 }
 
@@ -232,6 +308,9 @@ void UStudentPerceptor::OnPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
 
 AActor* UStudentPerceptor::GetHighestThreatZombie()
 {
+    // Purge any zombies that have been destroyed (e.g. shot dead) since perception last updated
+    PerceivedZombies.RemoveAll([](AActor* Z) { return !IsValid(Z); });
+
     if (PerceivedZombies.Num() == 0) return nullptr;
 
     AActor* ClosestZombie = nullptr;

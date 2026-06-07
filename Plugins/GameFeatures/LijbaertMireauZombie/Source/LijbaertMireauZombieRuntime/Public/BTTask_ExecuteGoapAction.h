@@ -17,4 +17,8 @@ public:
 
 	// This ticks every frame while the node is active
 	virtual void TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds) override;
+
+private:
+	// Cooldown between shots during kiting — prevents firing 60 times per second
+	float KitingShootTimer = 0.f;
 };

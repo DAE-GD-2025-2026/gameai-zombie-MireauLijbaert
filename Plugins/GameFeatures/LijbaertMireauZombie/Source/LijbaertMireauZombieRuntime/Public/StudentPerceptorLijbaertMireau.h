@@ -12,6 +12,7 @@
 #include "SteeringAgent.h"
 #include "SteeringBehaviors.h"
 #include "PathFollowSteeringBehavior.h"
+#include "CombinedSteeringBehaviors.h"
 #include "StudentPerceptorLijbaertMireau.generated.h"
 
 UENUM(BlueprintType)
@@ -63,12 +64,19 @@ public:
 	// True while in open-world wander (steering behavior)
 	bool IsWandering() const { return CurrentState == EMovementState::Wander; }
 
+	// True while actively fleeing a threat
+	bool IsFleeing() const { return CurrentState == EMovementState::Fleeing; }
+
 	// Start a 360° spin in place to trigger perception on items inside the house
 	void ActivateRotationSearch();
 
 	// Reset state at the start of a new loot-search phase
 	// (bActionFinished may still be true from the previous action — this clears it)
 	void BeginLootSearch() { bActionFinished = false; CurrentState = EMovementState::None; }
+
+	// When true, TickComponent will not override actor rotation based on movement direction.
+	// Set by the BT task during kiting so it can control facing toward the zombie.
+	bool bExternalRotationControl = false;
 	
 	UPROPERTY()
 	TArray<AActor*> PerceivedZombies;
@@ -105,9 +113,16 @@ private:
 	bool bHouseRotationDone = false;
 	float TotalRotationDone = 0.0f;
 
-	Wander* MyWanderBehavior = nullptr;
-	PathFollow* MyPathFollowBehavior = nullptr;
-	Flee*       MyFleeBehavior       = nullptr;
+	Wander*         MyWanderBehavior    = nullptr;
+	Seek*           MyDriftSeek         = nullptr;
+	BlendedSteering* MyBlendedWander   = nullptr;
+	PathFollow*     MyPathFollowBehavior = nullptr;
+	Flee*           MyFleeBehavior      = nullptr;
+
+	// Current long-range drift target for blended wander
+	FVector2D CurrentDriftTarget = FVector2D::ZeroVector;
+	float WanderStuckTimer = 0.f;
+	void PickNewDriftTarget();
 
 	TArray<AActor*> ExploredHouses;
 	AActor* CurrentTargetHouse = nullptr;

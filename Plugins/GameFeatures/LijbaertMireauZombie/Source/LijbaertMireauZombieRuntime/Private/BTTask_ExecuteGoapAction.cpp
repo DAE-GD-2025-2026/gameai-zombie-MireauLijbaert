@@ -7,7 +7,10 @@
 #include "Common/InventoryComponent.h"
 #include "Items/BaseItem.h"
 #include "Items/ItemType.h"
+#include "Items/Weapon.h"
+#include "Items/Medkit.h"
 #include "Village/House/House.h"
+#include "Survivor/SurvivorPawn.h"
 
 UBTTask_ExecuteGoapAction::UBTTask_ExecuteGoapAction()
 {
@@ -34,6 +37,10 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
     UStudentPerceptor* Perceptor = ControlledPawn->FindComponentByClass<UStudentPerceptor>();
     if (!Perceptor) { UE_LOG(LogTemp, Error, TEXT("BTTask: No Perceptor found on Pawn")); return EBTNodeResult::Failed; }
 
+    // Always reset external rotation control at the start of each action
+    Perceptor->bExternalRotationControl = false;
+    KitingShootTimer = 0.f;
+
     FGoapAction CurrentAction = Brain->GetCurrentPlan()[0];
     UE_LOG(LogTemp, Warning, TEXT("BTTask: Trying to execute action '%s'"), *CurrentAction.ActionName);
     
@@ -55,22 +62,8 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("BTTask: NavMesh unavailable — activating wander directly"));
-            Perceptor->ActivateWanderMode(); // NavMesh unavailable — fall straight through to wander
-            
-            // No house spotted — pathfind to a clear point to exit any house we may still be in,
-            // then TickTask will hand off to the wander steering behavior once we arrive.
-            // UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(ControlledPawn->GetWorld());
-            // FNavLocation ExitPoint;
-            // if (NavSys && NavSys->GetRandomReachablePointInRadius(ControlledPawn->GetActorLocation(), 2000.f, ExitPoint))
-            // {
-            //     UE_LOG(LogTemp, Warning, TEXT("BTTask: NavMesh exit query OK — navigating to exit point"));
-            //     Perceptor->ActivateNavigationTarget(ExitPoint.Location);
-            // }
-            // else
-            // {
-            //     
-            // }
+            // No house in sight yet — wander until perception spots one
+            Perceptor->ActivateWanderMode();
         }
         return EBTNodeResult::InProgress;
     }
@@ -82,8 +75,22 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
     }
     if (CurrentAction.ActionName == TEXT("Action_UseMedkit"))
     {
-        // No movement needed — instant use
-        // Just complete it immediately
+        ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(ControlledPawn);
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        if (SurvivorPawn && Inv)
+        {
+            const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+            for (int32 i = 0; i < Slots.Num(); ++i)
+            {
+                if (AMedkit* Medkit = Cast<AMedkit>(Slots[i]))
+                {
+                    Medkit->UseItem(*SurvivorPawn);
+                    Inv->RemoveItem(i);
+                    UE_LOG(LogTemp, Log, TEXT("BTTask: Used and consumed medkit '%s' from slot %d"), *Medkit->GetName(), i);
+                    break;
+                }
+            }
+        }
         Brain->CompleteCurrentAction();
         FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
         return EBTNodeResult::Succeeded;
@@ -102,6 +109,41 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
     UGoapAgentBrain* Brain = AIC->FindComponentByClass<UGoapAgentBrain>();
     UStudentPerceptor* Perceptor = ControlledPawn->FindComponentByClass<UStudentPerceptor>();
     if (!Brain || !Perceptor || Brain->GetCurrentPlan().Num() == 0) return;
+
+    // Opportunistic pickup: grab any useful item within touching range every tick,
+    // regardless of current action. Clears items that block movement when they spawn nearby.
+    {
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        if (Inv)
+        {
+            const float GrabRadiusSq = 150.f * 150.f;
+            FVector MyLoc = ControlledPawn->GetActorLocation();
+
+            for (int32 i = Perceptor->KnownItems.Num() - 1; i >= 0; --i)
+            {
+                AActor* LootActor = Perceptor->KnownItems[i];
+                if (!IsValid(LootActor)) { Perceptor->KnownItems.RemoveAt(i); continue; }
+
+                ABaseItem* Item = Cast<ABaseItem>(LootActor);
+                if (!Item || Item->GetItemType() == EItemType::Garbage) continue;
+                if (FVector::DistSquared(MyLoc, LootActor->GetActorLocation()) > GrabRadiusSq) continue;
+
+                const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+                for (int32 Slot = 0; Slot < Slots.Num(); ++Slot)
+                {
+                    if (Slots[Slot] == nullptr)
+                    {
+                        Inv->GrabItem(Slot, Item);
+                        Perceptor->PerceivedLoot.Remove(LootActor);
+                        Perceptor->KnownItems.RemoveAt(i);
+                        UE_LOG(LogTemp, Log, TEXT("BTTask: Opportunistic pickup '%s' into slot %d"), *Item->GetName(), Slot);
+                        break;
+                    }
+                }
+                break; // One item per tick to avoid array modification issues
+            }
+        }
+    }
 
     const FGoapAction& CurrentAction = Brain->GetCurrentPlan()[0];
 
@@ -144,8 +186,7 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
             }
 
             // State: idle (None) — plan just became ready after ExecuteTask returned early.
-            // Set up initial movement exactly as ExecuteTask would have.
-            UE_LOG(LogTemp, Warning, TEXT("BTTask: SearchHouse — plan ready, initializing movement"));
+            // Mirror what ExecuteTask would have done.
             AActor* HouseActor = Perceptor->GetNearestUnexploredHouse();
             if (HouseActor)
             {
@@ -155,18 +196,7 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
             }
             else
             {
-                UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(ControlledPawn->GetWorld());
-                FNavLocation ExitPoint;
-                if (NavSys && NavSys->GetRandomReachablePointInRadius(ControlledPawn->GetActorLocation(), 2000.f, ExitPoint))
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("BTTask: NavMesh exit query OK — navigating to exit point"));
-                    Perceptor->ActivateNavigationTarget(ExitPoint.Location);
-                }
-                else
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("BTTask: NavMesh unavailable — activating wander directly"));
-                    Perceptor->ActivateWanderMode();
-                }
+                Perceptor->ActivateWanderMode();
             }
             return;
         }
@@ -271,6 +301,103 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
         else
         {
             FinishLooting(TEXT("house fully looted"));
+        }
+        return;
+    }
+
+    // UseMedkit: instant use — handles the post-interrupt case where ExecuteTask never re-ran
+    if (CurrentAction.ActionName == TEXT("Action_UseMedkit"))
+    {
+        ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(ControlledPawn);
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        if (SurvivorPawn && Inv)
+        {
+            const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+            for (int32 i = 0; i < Slots.Num(); ++i)
+            {
+                if (AMedkit* Medkit = Cast<AMedkit>(Slots[i]))
+                {
+                    Medkit->UseItem(*SurvivorPawn);
+                    Inv->RemoveItem(i);
+                    UE_LOG(LogTemp, Log, TEXT("BTTask: Used and consumed medkit '%s' from slot %d (TickTask path)"), *Medkit->GetName(), i);
+                    break;
+                }
+            }
+        }
+        Brain->CompleteCurrentAction();
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        return;
+    }
+
+    // Kiting: flee from zombie, face it and shoot periodically
+    if (CurrentAction.ActionName == TEXT("Action_Kiting"))
+    {
+        // If flee hasn't been started yet (plan was interrupted and re-routed here without
+        // ExecuteTask running), kick it off now
+        if (!Perceptor->IsFleeing())
+        {
+            AActor* InitThreat = Perceptor->GetHighestThreatZombie();
+            if (InitThreat)
+            {
+                Perceptor->ActivateFleeFrom(InitThreat->GetActorLocation());
+                UE_LOG(LogTemp, Log, TEXT("BTTask: Kiting — re-initializing flee from TickTask"));
+            }
+        }
+
+        // Check whether we have a usable weapon
+        bool bHasUsableWeapon = false;
+        {
+            UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+            if (Inv)
+            {
+                for (ABaseItem* Item : Inv->GetInventory())
+                {
+                    AWeapon* W = Cast<AWeapon>(Item);
+                    if (W && W->GetValue() > 0) { bHasUsableWeapon = true; break; }
+                }
+            }
+        }
+
+        // Only take rotation control when we can actually shoot — otherwise let movement
+        // direction drive facing (survivor looks where they're running, not back at threat)
+        Perceptor->bExternalRotationControl = bHasUsableWeapon;
+
+        AActor* Threat = Perceptor->GetHighestThreatZombie();
+        if (Threat && bHasUsableWeapon)
+        {
+            // Face toward the zombie so UseItem fires along the forward vector
+            FVector ToThreat = (Threat->GetActorLocation() - ControlledPawn->GetActorLocation()).GetSafeNormal();
+            ControlledPawn->SetActorRotation(FRotator(0.f, ToThreat.ToOrientationRotator().Yaw, 0.f));
+
+            // Shoot on cooldown
+            KitingShootTimer -= DeltaSeconds;
+            if (KitingShootTimer <= 0.f)
+            {
+                ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(ControlledPawn);
+                UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+                if (SurvivorPawn && Inv)
+                {
+                    for (ABaseItem* Item : Inv->GetInventory())
+                    {
+                        AWeapon* Weapon = Cast<AWeapon>(Item);
+                        if (Weapon && Weapon->GetValue() > 0)
+                        {
+                            Weapon->UseItem(*SurvivorPawn);
+                            UE_LOG(LogTemp, Log, TEXT("BTTask: Kiting — fired %s"), *Weapon->GetName());
+                            break;
+                        }
+                    }
+                }
+                KitingShootTimer = 0.5f; // one shot attempt every 0.5 seconds
+            }
+        }
+
+        // Complete when flee behavior loses the zombie
+        if (Perceptor->IsCurrentActionFinished())
+        {
+            Perceptor->bExternalRotationControl = false;
+            Brain->CompleteCurrentAction();
+            FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
         }
         return;
     }
