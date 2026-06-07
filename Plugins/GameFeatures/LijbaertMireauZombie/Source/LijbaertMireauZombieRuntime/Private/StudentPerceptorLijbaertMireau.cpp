@@ -5,6 +5,9 @@
 #include "Zombies/BaseZombie.h"
 #include "Items/BaseItem.h"
 #include "Items/ItemType.h"
+#include "Items/Weapon.h"
+#include "Items/Medkit.h"
+#include "Items/Food.h"
 #include "Village/House/House.h"
 #include "Survivor/SurvivorPawn.h"
 
@@ -36,6 +39,7 @@ void UStudentPerceptor::ActivateWanderMode()
 {
     bActionFinished = false;
     CurrentState = EMovementState::Wander;
+    ScanOscillationTime = 0.f;
     PickNewDriftTarget();
 }
 
@@ -45,7 +49,31 @@ void UStudentPerceptor::PickNewDriftTarget()
     UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(GetWorld());
     FNavLocation NavResult;
 
-    if (NavSys && NavSys->GetRandomReachablePointInRadius(MyLoc, FMath::RandRange(3000.f, 6000.f), NavResult))
+    // Zigzag sweep: advance in SweepDir for 3 steps, then shift perpendicular and flip direction.
+    // This creates a lawn-mower pattern across the map instead of random clustering.
+    const int32 StepsPerRow = 3;
+    const float SweepBias   = 4000.f; // how far ahead we aim each step
+    const float ShiftBias   = 3000.f; // how far we shift sideways between rows
+    const float SearchRadius = 1500.f;
+
+    FVector BiasCenter;
+    if (bNextPickIsShift)
+    {
+        // Perpendicular shift
+        FVector2D PerpDir(-SweepDir.Y, SweepDir.X);
+        BiasCenter = MyLoc + FVector(PerpDir.X, PerpDir.Y, 0.f) * ShiftBias;
+        SweepDir   = -SweepDir; // reverse for the next row
+        bNextPickIsShift = false;
+        SweepStepsTaken  = 0;
+    }
+    else
+    {
+        BiasCenter = MyLoc + FVector(SweepDir.X, SweepDir.Y, 0.f) * SweepBias;
+        if (++SweepStepsTaken >= StepsPerRow)
+            bNextPickIsShift = true;
+    }
+
+    if (NavSys && NavSys->GetRandomReachablePointInRadius(BiasCenter, SearchRadius, NavResult))
     {
         CurrentDriftTarget = FVector2D(NavResult.Location.X, NavResult.Location.Y);
     }
@@ -151,9 +179,52 @@ AActor* UStudentPerceptor::GetNearestUsefulLoot()
     return Nearest;
 }
 
+// Helper macro, avoids repeating the same nearest-in-KnownItems loop three times
+template<typename TItemType>
+static AActor* FindNearestKnownOfType(const TArray<AActor*>& KnownItems, const FVector& MyLoc)
+{
+    AActor* Nearest = nullptr;
+    float NearestDistSq = MAX_FLT;
+    for (AActor* Actor : KnownItems)
+    {
+        if (!IsValid(Actor)) continue;
+        if (!Cast<TItemType>(Actor)) continue;
+        float DistSq = FVector::DistSquared(MyLoc, Actor->GetActorLocation());
+        if (DistSq < NearestDistSq) { NearestDistSq = DistSq; Nearest = Actor; }
+    }
+    return Nearest;
+}
+
+AActor* UStudentPerceptor::GetNearestKnownWeapon()
+{
+    return FindNearestKnownOfType<AWeapon>(KnownItems, GetOwner()->GetActorLocation());
+}
+
+AActor* UStudentPerceptor::GetNearestKnownMedkit()
+{
+    return FindNearestKnownOfType<AMedkit>(KnownItems, GetOwner()->GetActorLocation());
+}
+
+AActor* UStudentPerceptor::GetNearestKnownFood()
+{
+    return FindNearestKnownOfType<AFood>(KnownItems, GetOwner()->GetActorLocation());
+}
+
 void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+    // Tick zombie memory, clear once it expires
+    if (ZombieMemoryTimer > 0.f)
+    {
+        ZombieMemoryTimer -= DeltaTime;
+        if (ZombieMemoryTimer <= 0.f)
+        {
+            ZombieMemoryTimer = 0.f;
+            bHasThreatMemory = false;
+            UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: Zombie memory expired"));
+        }
+    }
 
     APawn* PawnOwner = Cast<APawn>(GetOwner());
     if (!PawnOwner || CurrentState == EMovementState::None) return;
@@ -174,12 +245,12 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
             WanderStuckTimer = 0.f;
         }
 
-        // Stuck detection if barely moving for 1.5s, pathfind to drift target to route around the wall
+        // Stuck detection if barely moving for 0.5s, pathfind to drift target to route around the wall
         const float SpeedSq = PawnOwner->GetVelocity().SizeSquared2D();
         if (SpeedSq < 50.f * 50.f)
         {
             WanderStuckTimer += DeltaTime;
-            if (WanderStuckTimer >= 1.5f)
+            if (WanderStuckTimer >= 0.5f)
             {
                 WanderStuckTimer = 0.f;
                 UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: Wander stuck — pathfinding around wall to drift target"));
@@ -249,9 +320,25 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
                 MyFleeBehavior->SetTarget(T);
             }
         }
+        else if (bHasThreatMemory)
+        {
+            // Zombie left sight but we remember where it was, keep fleeing from that position
+            const float SafeFleeDistSq = 2000.f * 2000.f;
+            if (FVector::DistSquared(GetOwner()->GetActorLocation(), LastKnownZombieLocation) > SafeFleeDistSq)
+            {
+                bActionFinished = true;
+                CurrentState = EMovementState::None;
+            }
+            else
+            {
+                FTargetData T;
+                T.Position = FVector2D(LastKnownZombieLocation.X, LastKnownZombieLocation.Y);
+                MyFleeBehavior->SetTarget(T);
+            }
+        }
         else
         {
-            // Lost the zombie — done fleeing
+            // Zombie gone, memory expired — done fleeing
             bActionFinished = true;
             CurrentState = EMovementState::None;
         }
@@ -268,41 +355,78 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
         // Only override rotation if the BT task isn't controlling it externally (e.g. during kiting)
         if (!bExternalRotationControl)
         {
-            FRotator TargetRotation = FRotationMatrix::MakeFromX(MovementVector).Rotator();
-            PawnOwner->SetActorRotation(FRotator(0.f, TargetRotation.Yaw, 0.f));
+            FRotator BaseRotation = FRotationMatrix::MakeFromX(MovementVector).Rotator();
+            float ScanOffset = 0.f;
+            if (CurrentState == EMovementState::Wander)
+            {
+                ScanOscillationTime += DeltaTime;
+                ScanOffset = FMath::Sin(ScanOscillationTime * (PI / 2.f)) * 70.f;
+            }
+            else if (CurrentState == EMovementState::Fleeing)
+            {
+                ScanOscillationTime += DeltaTime;
+                ScanOffset = FMath::Sin(ScanOscillationTime * (PI / 3.f)) * 120.f;
+            }
+            else
+            {
+                ScanOscillationTime = 0.f;
+            }
+            PawnOwner->SetActorRotation(FRotator(0.f, BaseRotation.Yaw + ScanOffset, 0.f));
         }
     }
 }
 
 void UStudentPerceptor::OnPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
 {
-    
     GEngine->AddOnScreenDebugMessage(5, 1.f, FColor::Green, FString::Printf(TEXT("Saw Something!")));
-    
+
     if (!Actor) return;
 
-    // Use proper type checks via Cast — no string hacking needed since we depend on GameAI_Zombie
     const bool bIsZombie = Cast<ABaseZombie>(Actor) != nullptr;
     const bool bIsLoot   = Cast<ABaseItem>(Actor)   != nullptr;
     const bool bIsHouse  = Cast<AHouse>(Actor)      != nullptr;
 
+    // Damage sense: we were hit, treat the attacker as a perceived threat immediately
+    const bool bIsDamage = (Stimulus.Type == UAISense::GetSenseID<UAISense_Damage>());
+    if (bIsDamage && bIsZombie && Stimulus.WasSuccessfullySensed())
+    {
+        PerceivedZombies.AddUnique(Actor);
+        LastKnownZombieLocation = Actor->GetActorLocation();
+        ZombieMemoryTimer = ZombieMemoryDuration;
+        bHasThreatMemory = true;
+        UE_LOG(LogTemp, Warning, TEXT("StudentPerceptor: Took damage from zombie — threat registered!"));
+        return;
+    }
+
     if (Stimulus.WasSuccessfullySensed())
     {
-        if (bIsZombie) PerceivedZombies.AddUnique(Actor);
-        if (bIsHouse)  PerceivedHouses.AddUnique(Actor);
+        if (bIsZombie)
+        {
+            PerceivedZombies.AddUnique(Actor);
+            // Refresh memory timer while we can see the zombie
+            ZombieMemoryTimer = ZombieMemoryDuration;
+            bHasThreatMemory = false; // actively seeing it, not relying on memory
+        }
+        if (bIsHouse) PerceivedHouses.AddUnique(Actor);
         if (bIsLoot)
         {
             PerceivedLoot.AddUnique(Actor);
-            // Also store in persistent memory — survives leaving the FOV
             KnownItems.AddUnique(Actor);
         }
     }
     else
     {
-        // Lost sight — remove from "currently visible" lists
-        if (bIsZombie) PerceivedZombies.Remove(Actor);
-        if (bIsLoot)   PerceivedLoot.Remove(Actor);
-        // KnownItems and PerceivedHouses intentionally NOT cleared here — we remember them
+        if (bIsZombie)
+        {
+            // Store last known position before losing sight keep fleeing from there
+            if (IsValid(Actor))
+                LastKnownZombieLocation = Actor->GetActorLocation();
+            ZombieMemoryTimer = ZombieMemoryDuration;
+            bHasThreatMemory = true;
+            PerceivedZombies.Remove(Actor);
+            UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: Lost sight of zombie — remembering position for %.1fs"), ZombieMemoryDuration);
+        }
+        if (bIsLoot) PerceivedLoot.Remove(Actor);
     }
 }
 

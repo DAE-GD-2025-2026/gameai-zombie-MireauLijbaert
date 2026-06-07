@@ -98,14 +98,24 @@ public:
 	
 	AActor* GetHighestThreatZombie();
 	AActor* GetNearestLoot();
-	AActor* GetNearestUsefulLoot(); // Nearest non-garbage item
+	AActor* GetNearestUsefulLoot(); // Nearest non-garbage item (no type filter)
+
+	// Typed recall, returns the nearest remembered item of each category from KnownItems
+	AActor* GetNearestKnownWeapon();
+	AActor* GetNearestKnownMedkit();
+	AActor* GetNearestKnownFood();
+
 	AActor* GetNearestUnexploredHouse();
 	void MarkCurrentHouseExplored();
 	AActor* GetCurrentTargetHouse() const { return CurrentTargetHouse; }
 
 	// Degrees per second for the house scan rotation (full 360° / this = scan duration)
 	UPROPERTY(EditAnywhere, Category = "AI|Search")
-	float RotationSearchSpeed = 90.0f;
+	float RotationSearchSpeed = 270.0f;
+
+	// True while we still remember a zombie that left our sight (keeps kiting active)
+	bool HasThreatMemory() const { return bHasThreatMemory; }
+	FVector GetLastKnownZombieLocation() const { return LastKnownZombieLocation; }
 
 private:
 	EMovementState CurrentState = EMovementState::None;
@@ -123,6 +133,20 @@ private:
 	FVector2D CurrentDriftTarget = FVector2D::ZeroVector;
 	float WanderStuckTimer = 0.f;
 	void PickNewDriftTarget();
+
+	// Zigzag sweep state
+	FVector2D SweepDir = FVector2D(1.f, 0.f);
+	int32 SweepStepsTaken = 0;
+	bool bNextPickIsShift = false;
+
+	// Head-scan oscillation during wander, sweeps perception cone left/right while walking
+	float ScanOscillationTime = 0.f;
+
+	// Zombie memory, keep fleeing a short time after losing sight
+	FVector LastKnownZombieLocation = FVector::ZeroVector;
+	float ZombieMemoryTimer = 0.f;
+	static constexpr float ZombieMemoryDuration = 5.0f;
+	bool bHasThreatMemory = false;
 
 	TArray<AActor*> ExploredHouses;
 	AActor* CurrentTargetHouse = nullptr;

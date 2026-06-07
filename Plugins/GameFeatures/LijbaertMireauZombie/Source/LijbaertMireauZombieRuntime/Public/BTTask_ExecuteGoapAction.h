@@ -21,4 +21,10 @@ public:
 private:
 	// Cooldown between shots during kiting — prevents firing 60 times per second
 	float KitingShootTimer = 0.f;
+
+	// Throttle for navigate-toward-zombie calls in fight mode (avoids pathfinding every frame)
+	float KitingApproachTimer = 0.f;
+
+	// True while navigating toward a house during unarmed kiting (house-dash mode)
+	bool bKitingToHouse = false;
 };

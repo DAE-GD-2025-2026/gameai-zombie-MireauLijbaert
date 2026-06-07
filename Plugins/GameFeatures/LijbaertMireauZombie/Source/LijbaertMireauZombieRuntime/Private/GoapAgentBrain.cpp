@@ -6,6 +6,7 @@
 #include "Common/HealthComponent.h"
 #include "Common/StaminaComponent.h"
 #include "Items/BaseItem.h"
+#include "Items/ItemType.h"
 #include "Items/Medkit.h"
 #include "Items/Weapon.h"
 #include "Items/Food.h"
@@ -330,7 +331,8 @@ void UGoapAgentBrain::AbortCurrentPlan()
 // Specific to my goals
 void UGoapAgentBrain::CalculateDesirability()
 {
-    bool bZombiesDetected = (CachedPerceptor->PerceivedZombies.Num() > 0);
+    // Treat remembered zombie positions as still-active threats so we keep fleeing
+    bool bZombiesDetected = (CachedPerceptor->PerceivedZombies.Num() > 0) || CachedPerceptor->HasThreatMemory();
     CurrentState.Add(TEXT("ZombiesNearby"), bZombiesDetected ? 1 : 0);
     
     APawn* Pawn = Cast<APawn>(CachedPerceptor->GetOwner());
@@ -358,22 +360,43 @@ void UGoapAgentBrain::CalculateDesirability()
     }
     const float StaminaMissing = MaxStamina - CurrentStamina;
 
-    // Read inventory — identify what we have
+    // Read inventory — identify what we have, purge empty weapons, track free slots and counts
     bool bHasMedkit = false;
     bool bHasWeapon = false;
     bool bHasFood = false;
     bool bHasUsableFood = false; // food whose value fits in remaining stamina (no waste)
+    bool bHasFreeSlot = false;
+    int32 NumWeapons = 0;
+    int32 NumMedkits = 0;
+    int32 NumFoods   = 0;
     if (Pawn)
     {
         if (UInventoryComponent* InvComp = Pawn->FindComponentByClass<UInventoryComponent>())
         {
+            // First pass: remove empty weapons (0 ammo) to free inventory slots
+            const TArray<ABaseItem*>& Slots = InvComp->GetInventory();
+            for (int32 i = Slots.Num() - 1; i >= 0; --i)
+            {
+                AWeapon* W = Cast<AWeapon>(Slots[i]);
+                if (W && W->GetValue() <= 0)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("GoapBrain: Removing empty weapon '%s' from slot %d"), *W->GetName(), i);
+                    InvComp->RemoveItem(i);
+                }
+            }
+
+            // Second pass: read remaining inventory and count by type
             for (ABaseItem* Item : InvComp->GetInventory())
             {
-                if (!Item) continue;
-                if (Cast<AMedkit>(Item)) bHasMedkit = true;
-                if (Cast<AWeapon>(Item)) bHasWeapon = true;
-                if (AFood* Food = Cast<AFood>(Item))
+                if (!Item) { bHasFreeSlot = true; continue; }
+                if (Cast<AMedkit>(Item)) { bHasMedkit = true; ++NumMedkits; }
+                else if (AWeapon* W = Cast<AWeapon>(Item))
                 {
+                    if (W->GetValue() > 0) { bHasWeapon = true; ++NumWeapons; }
+                }
+                else if (AFood* Food = Cast<AFood>(Item))
+                {
+                    ++NumFoods;
                     if (Food->GetValue() > 0)
                     {
                         bHasFood = true;
@@ -383,6 +406,27 @@ void UGoapAgentBrain::CalculateDesirability()
                 }
             }
         }
+    }
+
+    // Scan KnownItems for remembered item types we still want (respects per-type limits)
+    // Weapon limit: 3 combined  |  Medkit limit: 2  |  Food limit: 2
+    bool bHasKnownWeapon = false;
+    bool bHasKnownMedkit = false;
+    bool bHasKnownFood   = false;
+    for (AActor* KnownActor : CachedPerceptor->KnownItems)
+    {
+        if (!IsValid(KnownActor)) continue;
+        if (!bHasKnownWeapon && Cast<AWeapon>(KnownActor) && NumWeapons < 3) bHasKnownWeapon = true;
+        if (!bHasKnownMedkit && Cast<AMedkit>(KnownActor) && NumMedkits < 2) bHasKnownMedkit = true;
+        if (!bHasKnownFood   && Cast<AFood>  (KnownActor) && NumFoods   < 2) bHasKnownFood   = true;
+        if (bHasKnownWeapon && bHasKnownMedkit && bHasKnownFood) break;
+    }
+
+    // If we remember a wanted item and have a free slot, bypass SearchHouse so PickupLoot
+    // can navigate directly to it without needing to scan a new house first.
+    if (bHasFreeSlot && (bHasKnownWeapon || bHasKnownMedkit || bHasKnownFood))
+    {
+        CurrentState.Add(TEXT("HouseExplored"), 1);
     }
 
     CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
@@ -426,18 +470,29 @@ void UGoapAgentBrain::CalculateDesirability()
         // Dependency for: "Search Houses for Loot"
         else if (Strategy.GoalKey == TEXT("HasResources"))
         {
-            if (!bZombiesDetected && CurrentHealth >= 3.0f)
+            if (!bZombiesDetected)
             {
-                Strategy.DesirabilityScore = 40.0f; // Baseline exploration
+                // Recall urgency: prioritise fetching a specific remembered item over general looting.
+                // No weapon is the highest recall priority, always want one.
+                if (!bHasWeapon && bHasKnownWeapon)
+                    Strategy.DesirabilityScore = 85.0f; // Fetch remembered gun ASAP
+                else if (CurrentHealth < 3.0f && !bHasMedkit && bHasKnownMedkit)
+                    Strategy.DesirabilityScore = 80.0f; // Fetch remembered medkit when injured
+                else if (StaminaMissing > 5.0f && !bHasUsableFood && bHasKnownFood)
+                    Strategy.DesirabilityScore = 55.0f; // Fetch remembered food when very low stamina
+                else if (CurrentHealth >= 3.0f)
+                    Strategy.DesirabilityScore = 40.0f; // Baseline exploration
+                else
+                    Strategy.DesirabilityScore = 10.0f; // Injured but no known fix — suppress
             }
             else if (bZombiesDetected && !bHasWeapon)
             {
-                // Zombies nearby and no weapon — urgently search for one after fleeing
+                // Threat active, no weapon — boosted so we search immediately after threat clears
                 Strategy.DesirabilityScore = 70.0f;
             }
             else
             {
-                Strategy.DesirabilityScore = 10.0f; // Suppressed under duress
+                Strategy.DesirabilityScore = 10.0f; // Suppressed while dealing with threat
             }
         }
     }
