@@ -33,6 +33,15 @@ void UStudentPerceptor::ActivateWanderMode()
     CurrentState = EMovementState::Wander;
 }
 
+void UStudentPerceptor::ActivateRotationSearch()
+{
+    bActionFinished = false;
+    bHouseRotationDone = false;
+    TotalRotationDone = 0.0f;
+    CurrentState = EMovementState::RotatingSearch;
+    UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: Starting 360 rotation scan inside house"));
+}
+
 void UStudentPerceptor::ActivateNavigationTarget(const FVector& TargetWorldPos)
 {
     bActionFinished = false;
@@ -94,13 +103,14 @@ AActor* UStudentPerceptor::GetNearestLoot()
 
 AActor* UStudentPerceptor::GetNearestUsefulLoot()
 {
+    // Search persistent memory — KnownItems survives the FOV sweeping away after a house scan
     AActor* Nearest = nullptr;
     float NearestDistSq = MAX_FLT;
     FVector MyLoc = GetOwner()->GetActorLocation();
 
-    for (AActor* Loot : PerceivedLoot)
+    for (AActor* Loot : KnownItems)
     {
-        if (!Loot) continue;
+        if (!IsValid(Loot)) continue; // Skip actors that have been destroyed/picked up by others
         ABaseItem* Item = Cast<ABaseItem>(Loot);
         if (!Item || Item->GetItemType() == EItemType::Garbage) continue;
 
@@ -139,6 +149,22 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
             bActionFinished = true;
             CurrentState = EMovementState::None;
         }
+    }
+    else if (CurrentState == EMovementState::RotatingSearch)
+    {
+        // Rotate the pawn in place — perception fires as items come into the FOV cone
+        TotalRotationDone += RotationSearchSpeed * DeltaTime;
+        float NewYaw = PawnOwner->GetActorRotation().Yaw + RotationSearchSpeed * DeltaTime;
+        PawnOwner->SetActorRotation(FRotator(0.f, NewYaw, 0.f));
+
+        if (TotalRotationDone >= 360.0f)
+        {
+            bHouseRotationDone = true;
+            bActionFinished = true;
+            CurrentState = EMovementState::None;
+            UE_LOG(LogTemp, Log, TEXT("StudentPerceptor: 360 scan complete, %d loot items spotted"), PerceivedLoot.Num());
+        }
+        return; // No movement output needed — rotation is applied directly above
     }
     else if (CurrentState == EMovementState::Fleeing)
     {
@@ -187,14 +213,20 @@ void UStudentPerceptor::OnPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
     if (Stimulus.WasSuccessfullySensed())
     {
         if (bIsZombie) PerceivedZombies.AddUnique(Actor);
-        if (bIsLoot)   PerceivedLoot.AddUnique(Actor);
         if (bIsHouse)  PerceivedHouses.AddUnique(Actor);
+        if (bIsLoot)
+        {
+            PerceivedLoot.AddUnique(Actor);
+            // Also store in persistent memory — survives leaving the FOV
+            KnownItems.AddUnique(Actor);
+        }
     }
     else
     {
+        // Lost sight — remove from "currently visible" lists
         if (bIsZombie) PerceivedZombies.Remove(Actor);
         if (bIsLoot)   PerceivedLoot.Remove(Actor);
-        // Houses stay in memory even out of sight — once you see a house, you remember where it is
+        // KnownItems and PerceivedHouses intentionally NOT cleared here — we remember them
     }
 }
 
