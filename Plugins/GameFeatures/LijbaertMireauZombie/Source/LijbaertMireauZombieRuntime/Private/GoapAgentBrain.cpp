@@ -1,10 +1,15 @@
 ﻿#include "GoapAgentBrain.h"
 #include "GameFramework/Character.h"
 #include "GoapAgentInterface.h"
+#include "AIController.h"
 
 UGoapAgentBrain::UGoapAgentBrain()
 {
     PrimaryComponentTick.bCanEverTick = true;
+}
+
+void UGoapAgentBrain::BeginPlay()
+{
     SetupGoalsAndActions();
 }
 
@@ -74,9 +79,19 @@ void UGoapAgentBrain::SetupGoalsAndActions()
     HealAction.Effects.Add(TEXT("IsHealthy"), 1);
     Actions.Add(HealAction);
     
-    FGoapState InitialState; // Start blank
+    FGoapState InitialState;
+    InitialState.Add(TEXT("ZombiesNearby"), 0);
+    InitialState.Add(TEXT("HasWeapon"), 0);
+    InitialState.Add(TEXT("HasMedkit"), 0);
+    InitialState.Add(TEXT("HouseExplored"), 0);
+    InitialState.Add(TEXT("HasResources"), 0);
+    InitialState.Add(TEXT("IsHealthy"), 1);
+    
     InitializeAgent(Actions, Goals, InitialState);
     
+    CurrentGoal.Empty();
+    CurrentGoal.Add(TEXT("HasResources"), 1);
+    VisualCurrentGoalName = TEXT("Search Houses for Loot");
 }
 
 void UGoapAgentBrain::InitializeAgent(const TArray<FGoapAction>& CustomActions, const TArray<FGoapGoalStrategy>& Goals, const FGoapState& InitialState)
@@ -111,27 +126,36 @@ void UGoapAgentBrain::ProcessHighestPriorityGoal(const TArray<FGoapGoalStrategy>
 
 void UGoapAgentBrain::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
+    // Search for the perceptor so we can extract data like percievedZombes/items
+    // Only need it once but in tick so we don't have problems with it not being constructed yet
+    if (CachedPerceptor == nullptr)
+    {
+        if (AAIController* AIController = Cast<AAIController>(GetOwner()))
+        {
+            if (APawn* PossessedPawn = AIController->GetPawn())
+            {
+                CachedPerceptor = PossessedPawn->FindComponentByClass<UStudentPerceptor>();
+                
+                if (CachedPerceptor)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("[%s] GOAP Brain successfully linked and cached StudentPerceptor!"), *GetOwner()->GetName());
+                }
+            }
+        }
+    }
+
+    // When one is foundwe just run like normal
+    if (CachedPerceptor != nullptr)
+    {
+        CalculateDesirability();
+    }
+    
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
     
     // If we are actively running an action, pass control off to the AI Controller / Character loop
     if (bIsExecutingAction)
     {
-        ActionDurationTimer -= DeltaTime;
-
-        IGoapAgentInterface* GoapInterface = Cast<IGoapAgentInterface>(GetOwner());
-        bool bCharacterIsFinished = (ActionDurationTimer <= 0.0f);
-
-        // If the timer is up, OR the character explicitly tells us they finished early via code
-        if (GoapInterface && GoapInterface->IsActionFinished(CurrentlyRunningAction.ActionName))
-        {
-            bCharacterIsFinished = true;
-        }
-
-        if (bCharacterIsFinished)
-        {
-            CompleteCurrentAction();
-        }
-        return;
+       return;
     }
    
     if (PlanningCooldownTimer > 0.0f)
@@ -148,8 +172,6 @@ void UGoapAgentBrain::TickComponent(float DeltaTime, ELevelTick TickType, FActor
     {
         StartNextPlanStep();
     }
-    
-    
 }
 
 void UGoapAgentBrain::FindNewPlan()
@@ -197,33 +219,10 @@ void UGoapAgentBrain::StartNextPlanStep()
     bIsExecutingAction = true;
     VisualCurrentActionName = CurrentlyRunningAction.ActionName;
 
-    UE_LOG(LogTemp, Log, TEXT("[%s] GOAP Brain: Initiating Action -> '%s'"), *GetOwner()->GetName(), *CurrentlyRunningAction.ActionName);
-    
-    if (GetOwner()->GetClass()->ImplementsInterface(UGoapAgentInterface::StaticClass()))
-    {
-        IGoapAgentInterface* GoapInterface = Cast<IGoapAgentInterface>(GetOwner());
-        if (GoapInterface)
-        {
-            // Ask the character how long this specific action takes
-            ActionDurationTimer = GoapInterface->GetActionDuration(CurrentlyRunningAction.ActionName);
-        
-            // Tell the character to start physically performing it (e.g., play reload animation, play eating sound)
-            bool bStarted = GoapInterface->ExecutePhysicalAction(CurrentlyRunningAction.ActionName);
-        
-            if (bStarted)
-            {
-                bIsExecutingAction = true;
-                OnActionStarted.Broadcast(CurrentlyRunningAction.ActionName);
-                return;
-            }
-        }
-    }
+    UE_LOG(LogTemp, Log, TEXT("[%s] GOAP Brain: Initiating Action -> '%s'"),
+        *GetOwner()->GetName(), *CurrentlyRunningAction.ActionName);
 
-    // Fallback safety if the character doesn't implement the interface or fails to execute
-    UE_LOG(LogTemp, Warning, TEXT("[%s] Brain: Owner cannot execute action '%s'"), *GetOwner()->GetName(), *CurrentlyRunningAction.ActionName);
-    AbortCurrentPlan();
-    
-    // Broadcast cleanly to either C++ Listeners, Behavior Trees, or Blueprints
+    // Broadcast so the BT task knows to start executing
     OnActionStarted.Broadcast(CurrentlyRunningAction.ActionName);
 }
 
@@ -263,68 +262,100 @@ void UGoapAgentBrain::AbortCurrentPlan()
 // Specific to my goals
 void UGoapAgentBrain::CalculateDesirability()
 {
-   // if (!Perceptor) return;
+    bool bZombiesDetected = (CachedPerceptor->PerceivedZombies.Num() > 0);
+    CurrentState.Add(TEXT("ZombiesNearby"), bZombiesDetected ? 1 : 0);
+    
+    APawn* Pawn = Cast<APawn>(CachedPerceptor->GetOwner());
 
-  
-    //bool bZombiesDetected = (Perceptor->PerceivedZombies.Num() > 0);
-    //CurrentState.Add(TEXT("ZombiesNearby"), bZombiesDetected ? 1 : 0);
+    // Read Health via reflection
+    float CurrentHealth = 100.f;
+    if (Pawn)
+    {
+        if (UActorComponent* HPComp = Pawn->GetComponentByClass(
+            UClass::TryFindTypeSlow<UClass>(TEXT("/Script/GameAI_Zombie.HealthComponent"))))
+        {
+            // GetHealth() is a BlueprintPure UFUNCTION, so we can call it by name
+            struct { int32 ReturnValue; } HealthResult;
+            UFunction* GetHealthFunc = HPComp->FindFunction(FName("GetHealth"));
+            if (GetHealthFunc)
+            {
+                HPComp->ProcessEvent(GetHealthFunc, &HealthResult);
+                CurrentHealth = (float)HealthResult.ReturnValue;
+            }
+        }
+    }
 
-    // Grab status parameters from the teacher's pawn or components
-    // float CurrentHealth = ... Get Health ...
-    // bool bHasMedkit = ... Get Inventory Medkit Count ...
-    // bool bHasWeapon = ... Get Weapon Equipped ...
+    // Read Inventory via reflection
+    bool bHasMedkit = false;
+    bool bHasWeapon = false;
+    if (Pawn)
+    {
+        if (UActorComponent* InvComp = Pawn->GetComponentByClass(
+            UClass::TryFindTypeSlow<UClass>(TEXT("/Script/GameAI_Zombie.InventoryComponent"))))
+        {
+            struct { TArray<UObject*> ReturnValue; } InvResult;
+            UFunction* GetInvFunc = InvComp->FindFunction(FName("GetInventory"));
+            if (GetInvFunc)
+            {
+                InvComp->ProcessEvent(GetInvFunc, &InvResult);
+                for (UObject* Item : InvResult.ReturnValue)
+                {
+                    if (!Item) continue;
+                    FString ClassName = Item->GetClass()->GetName();
+                    if (ClassName.Contains(TEXT("Medkit")))  bHasMedkit = true;
+                    if (ClassName.Contains(TEXT("Pistol")) || 
+                        ClassName.Contains(TEXT("Shotgun"))) bHasWeapon = true;
+                }
+            }
+        }
+    }
 
-    // Mock parameters for compilation safety until connected:
-    // float CurrentHealth = 100.0f; 
-    // bool bHasMedkit = false;
-    // bool bHasWeapon = true;
-    //
-    // CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
-    // CurrentState.Add(TEXT("HasMedkit"), bHasMedkit ? 1 : 0);
-    //
-    //
-    // for (FGoapGoalStrategy& Strategy : PossibleGoals)
-    // {
-    //     // Dependency for: "Survive Threats"
-    //     if (Strategy.GoalKey == TEXT("ZombiesNearby"))
-    //     {
-    //         // If zombies are in our perception field, keep this maxed out.
-    //         // If they vanish, drop urgency to zero so we don't try to resolve a solved threat.
-    //         Strategy.DesirabilityScore = bZombiesDetected ? 95.0f : 0.0f;
-    //     }
-    //
-    //     // Dependency for: "Heal Critical Injuries"
-    //     else if (Strategy.GoalKey == TEXT("IsHealthy"))
-    //     {
-    //         // If our health drops below 30% AND we possess a healing item,
-    //         // make this the single most important task in existence.
-    //         if (CurrentHealth < 30.0f && bHasMedkit)
-    //         {
-    //             Strategy.DesirabilityScore = 100.0f; 
-    //         }
-    //         else
-    //         {
-    //             Strategy.DesirabilityScore = 0.0f; // Reset if healthy or helpless
-    //         }
-    //     }
-    //
-    //     // Dependency for: "Search Houses for Loot"
-    //     else if (Strategy.GoalKey == TEXT("HasResources"))
-    //     {
-    //         // Baseline exploration task. If we are completely safe from zombies
-    //         // and don't need emergency medical care, this stays active.
-    //         if (!bZombiesDetected && CurrentHealth >= 30.0f)
-    //         {
-    //             Strategy.DesirabilityScore = 40.0f;
-    //         }
-    //         else
-    //         {
-    //             Strategy.DesirabilityScore = 10.0f; // Suppressed under duress
-    //         }
-    //     }
-    // }
-    //
-    //
-    // // Send your newly weighted goal vectors right back into your strategy sorter loop!
-    // ProcessHighestPriorityGoal(PossibleGoals);
+    CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
+    CurrentState.Add(TEXT("HasMedkit"), bHasMedkit ? 1 : 0);
+
+    
+    for (FGoapGoalStrategy& Strategy : PossibleGoals)
+    {
+        // Dependency for: "Survive Threats"
+        if (Strategy.GoalKey == TEXT("ZombiesNearby"))
+        {
+            // If zombies are in our perception field, keep this maxed out.
+            // If they vanish, drop urgency to zero so we don't try to resolve a solved threat.
+            Strategy.DesirabilityScore = bZombiesDetected ? 95.0f : 0.0f;
+        }
+
+        // Dependency for: "Heal Critical Injuries"
+        else if (Strategy.GoalKey == TEXT("IsHealthy"))
+        {
+            // If our health drops below 30% AND we possess a healing item,
+            // make this the single most important task in existence.
+            if (CurrentHealth < 30.0f && bHasMedkit)
+            {
+                Strategy.DesirabilityScore = 100.0f; 
+            }
+            else
+            {
+                Strategy.DesirabilityScore = 0.0f; // Reset if healthy or helpless
+            }
+        }
+
+        // Dependency for: "Search Houses for Loot"
+        else if (Strategy.GoalKey == TEXT("HasResources"))
+        {
+            // Baseline exploration task. If we are completely safe from zombies
+            // and don't need emergency medical care, this stays active.
+            if (!bZombiesDetected && CurrentHealth >= 30.0f)
+            {
+                Strategy.DesirabilityScore = 40.0f;
+            }
+            else
+            {
+                Strategy.DesirabilityScore = 10.0f; // Suppressed under duress
+            }
+        }
+    }
+
+    
+    // Send your newly weighted goal vectors right back into your strategy sorter loop!
+    ProcessHighestPriorityGoal(PossibleGoals);
 }

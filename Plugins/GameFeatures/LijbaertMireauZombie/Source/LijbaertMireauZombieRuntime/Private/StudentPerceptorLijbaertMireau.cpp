@@ -7,6 +7,7 @@ UStudentPerceptor::UStudentPerceptor()
     // Instantiate your ported classes
     MyWanderBehavior = new Wander();
     MyPathFollowBehavior = new PathFollow();
+    MyFleeBehavior = new Flee();
 }
 
 void UStudentPerceptor::BeginPlay()
@@ -17,18 +18,18 @@ void UStudentPerceptor::BeginPlay()
     {
        PerceptionComp->OnTargetPerceptionUpdated.AddDynamic(this, &UStudentPerceptor::OnPerceptionUpdated);
     }
-
-    // TEMP
-    ActivateWanderMode(); 
 }
 
 void UStudentPerceptor::ActivateWanderMode()
 {
+    bActionFinished = false;
     CurrentState = EMovementState::Wander;
 }
 
 void UStudentPerceptor::ActivateNavigationTarget(const FVector& TargetWorldPos)
 {
+    bActionFinished = false;
+    
     APawn* GenericPawn = Cast<APawn>(GetOwner());
     if (!GenericPawn) return;
     
@@ -65,9 +66,38 @@ void UStudentPerceptor::ActivateNavigationTarget(const FVector& TargetWorldPos)
         CustomPath.push_back(FVector2D(Pt.X, Pt.Y));
     }
 
-    // 4. Feed your ported PathFollow algorithm
+    // Feed ported PathFollow algorithm
     MyPathFollowBehavior->SetPath(CustomPath);
     CurrentState = EMovementState::PathFollowing;
+}
+
+void UStudentPerceptor::ActivateFleeFrom(const FVector& ThreatWorldPos)
+{
+    bActionFinished = false;
+    FTargetData T;
+    T.Position = FVector2D(ThreatWorldPos.X, ThreatWorldPos.Y);
+    MyFleeBehavior->SetTarget(T);
+    CurrentState = EMovementState::Fleeing;
+}
+
+AActor* UStudentPerceptor::GetNearestLoot()
+{
+    if (PerceivedLoot.Num() == 0) return nullptr;
+
+    AActor* Nearest = nullptr;
+    float NearestDistSq = MAX_FLT;
+    FVector MyLoc = GetOwner()->GetActorLocation();
+
+    for (AActor* Loot : PerceivedLoot)
+    {
+        float DistSq = FVector::DistSquared(MyLoc, Loot->GetActorLocation());
+        if (DistSq < NearestDistSq)
+        {
+            NearestDistSq = DistSq;
+            Nearest = Loot;
+        }
+    }
+    return Nearest;
 }
 
 void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -88,6 +118,32 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
     else if (CurrentState == EMovementState::PathFollowing)
     {
         MathOutput = MyPathFollowBehavior->CalculateSteering(DeltaTime, Agent);
+        
+        // Detect when we've arrived (steering goes near-zero at destination)
+        if (MathOutput.LinearVelocity.SizeSquared() < 1.f)
+        {
+            bActionFinished = true;
+            CurrentState = EMovementState::None;
+        }
+    }
+    else if (CurrentState == EMovementState::Fleeing)
+    {
+        // Keep updating the threat position every tick so flee stays accurate
+        AActor* Threat = GetHighestThreatZombie();
+        if (Threat)
+        {
+            FTargetData T;
+            T.Position = FVector2D(Threat->GetActorLocation().X, Threat->GetActorLocation().Y);
+            T.LinearVelocity = FVector2D(Threat->GetVelocity().X, Threat->GetVelocity().Y);
+            MyFleeBehavior->SetTarget(T);
+        }
+        else
+        {
+            // Lost the zombie — done fleeing
+            bActionFinished = true;
+            CurrentState = EMovementState::None;
+        }
+        MathOutput = MyFleeBehavior->CalculateSteering(DeltaTime, Agent);
     }
 
     // Translate 2D Steering output velocity back to 3D Unreal movement space
@@ -104,8 +160,6 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
 
 void UStudentPerceptor::OnPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
 {
-    
-    // Keeping your existing debug print
     GEngine->AddOnScreenDebugMessage(5, 1.f, FColor::Green, FString::Printf(TEXT("Saw Something!")));
     
     if (!Actor) return;
@@ -144,5 +198,5 @@ AActor* UStudentPerceptor::GetHighestThreatZombie()
             ClosestZombie = Zombie;
         }
     }
-    return ClosestZombie; // This is the zombie your steering framework should Flee from or Shoot at!
+    return ClosestZombie;
 }

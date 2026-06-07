@@ -19,7 +19,8 @@ enum class EMovementState : uint8
 {
 	None,
 	Wander,
-	PathFollowing
+	PathFollowing,
+	Fleeing
 };
 
 UCLASS(ClassGroup=(Custom), meta=(BlueprintSpawnableComponent))
@@ -43,6 +44,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "AI Movement")
 	void ActivateNavigationTarget(const FVector& TargetWorldPos);
 	
+	UFUNCTION(BlueprintCallable, Category = "AI Movement")
+	void ActivateFleeFrom(const FVector& ThreatWorldPos);
+
+	// NEW: called by BT task to ask "are you done yet?"
+	bool IsCurrentActionFinished() const { return bActionFinished; }
+	
 	UPROPERTY()
 	TArray<AActor*> PerceivedZombies;
 
@@ -53,11 +60,13 @@ public:
 	float GetCurrentStamina() const;
 	
 	AActor* GetHighestThreatZombie();
+	AActor* GetNearestLoot(); 
 
 private:
 	EMovementState CurrentState = EMovementState::None;
-
+	bool bActionFinished = false; 
 	// Allocate your ported Reynolds math engines
 	Wander* MyWanderBehavior = nullptr;
 	PathFollow* MyPathFollowBehavior = nullptr;
+	Flee*       MyFleeBehavior       = nullptr;
 };

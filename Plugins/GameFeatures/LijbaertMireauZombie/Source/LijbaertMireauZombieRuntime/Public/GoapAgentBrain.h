@@ -4,6 +4,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "GoapPlanner.h"
+#include "StudentPerceptorLijbaertMireau.h"
 #include "GoapAgentBrain.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGoapActionSignature, const FString&, ActionName);
@@ -15,6 +16,8 @@ class LIJBAERTMIREAUZOMBIERUNTIME_API UGoapAgentBrain : public UActorComponent
 
 public: 
     UGoapAgentBrain();
+    
+    virtual void BeginPlay() override;
     
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
@@ -76,6 +79,7 @@ protected:
     FGoapAction CurrentlyRunningAction;
     
     float ActionDurationTimer{0};
+    UStudentPerceptor* CachedPerceptor;
 
 private:
     void FindNewPlan();
