@@ -9,6 +9,8 @@
 #include "Items/ItemType.h"
 #include "Items/Weapon.h"
 #include "Items/Medkit.h"
+#include "Items/Food.h"
+#include "Common/StaminaComponent.h"
 #include "Village/House/House.h"
 #include "Survivor/SurvivorPawn.h"
 
@@ -95,7 +97,34 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
         FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
         return EBTNodeResult::Succeeded;
     }
-   
+    if (CurrentAction.ActionName == TEXT("Action_UseFood"))
+    {
+        ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(ControlledPawn);
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        if (SurvivorPawn && Inv)
+        {
+            UStaminaComponent* StamComp = SurvivorPawn->FindComponentByClass<UStaminaComponent>();
+            const float StaminaMissing = StamComp ? (StamComp->GetMaxStamina() - StamComp->GetCurrentStamina()) : 10.0f;
+            const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+            for (int32 i = 0; i < Slots.Num(); ++i)
+            {
+                if (AFood* Food = Cast<AFood>(Slots[i]))
+                {
+                    if (Food->GetValue() > 0 && static_cast<float>(Food->GetValue()) <= StaminaMissing)
+                    {
+                        UE_LOG(LogTemp, Log, TEXT("BTTask: Eating food '%s' (value %d, stamina missing %.1f)"), *Food->GetName(), Food->GetValue(), StaminaMissing);
+                        Food->UseItem(*SurvivorPawn);
+                        Inv->RemoveItem(i);
+                        break;
+                    }
+                }
+            }
+        }
+        Brain->CompleteCurrentAction();
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        return EBTNodeResult::Succeeded;
+    }
+
     return EBTNodeResult::Failed;
 }
 
@@ -302,6 +331,35 @@ void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint
         {
             FinishLooting(TEXT("house fully looted"));
         }
+        return;
+    }
+
+    // UseFood: instant use — handles the post-interrupt case where ExecuteTask never re-ran
+    if (CurrentAction.ActionName == TEXT("Action_UseFood"))
+    {
+        ASurvivorPawn* SurvivorPawn = Cast<ASurvivorPawn>(ControlledPawn);
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        if (SurvivorPawn && Inv)
+        {
+            UStaminaComponent* StamComp = SurvivorPawn->FindComponentByClass<UStaminaComponent>();
+            const float StaminaMissing = StamComp ? (StamComp->GetMaxStamina() - StamComp->GetCurrentStamina()) : 10.0f;
+            const TArray<ABaseItem*>& Slots = Inv->GetInventory();
+            for (int32 i = 0; i < Slots.Num(); ++i)
+            {
+                if (AFood* Food = Cast<AFood>(Slots[i]))
+                {
+                    if (Food->GetValue() > 0 && static_cast<float>(Food->GetValue()) <= StaminaMissing)
+                    {
+                        UE_LOG(LogTemp, Log, TEXT("BTTask: Eating food '%s' (TickTask path)"), *Food->GetName());
+                        Food->UseItem(*SurvivorPawn);
+                        Inv->RemoveItem(i);
+                        break;
+                    }
+                }
+            }
+        }
+        Brain->CompleteCurrentAction();
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
         return;
     }
 

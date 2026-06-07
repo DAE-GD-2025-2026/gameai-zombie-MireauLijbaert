@@ -4,9 +4,11 @@
 #include "AIController.h"
 #include "Common/InventoryComponent.h"
 #include "Common/HealthComponent.h"
+#include "Common/StaminaComponent.h"
 #include "Items/BaseItem.h"
 #include "Items/Medkit.h"
 #include "Items/Weapon.h"
+#include "Items/Food.h"
 
 UGoapAgentBrain::UGoapAgentBrain()
 {
@@ -41,7 +43,15 @@ void UGoapAgentBrain::SetupGoalsAndActions()
     LootGoal.VisualName = TEXT("Search Houses for Loot");
     Goals.Add(LootGoal);
 
-    // Emergency Goal: Healing 
+    // Inventory Goal: Eat Food when stamina has room (frees inventory slot)
+    FGoapGoalStrategy EatFoodGoal;
+    EatFoodGoal.GoalKey = TEXT("HasFood");
+    EatFoodGoal.TargetValue = 0; // Want food consumed, not sitting in a slot
+    EatFoodGoal.DesirabilityScore = 0.0f; // Dynamic
+    EatFoodGoal.VisualName = TEXT("Eat Food");
+    Goals.Add(EatFoodGoal);
+
+    // Emergency Goal: Healing
     FGoapGoalStrategy CriticalHealGoal;
     CriticalHealGoal.GoalKey = TEXT("IsHealthy");
     CriticalHealGoal.TargetValue = 1;
@@ -82,11 +92,20 @@ void UGoapAgentBrain::SetupGoalsAndActions()
     HealAction.Preconditions.Add(TEXT("HasMedkit"), 1);
     HealAction.Effects.Add(TEXT("IsHealthy"), 1);
     Actions.Add(HealAction);
+
+    // Action Eat Food
+    FGoapAction EatFoodAction;
+    EatFoodAction.ActionName = TEXT("Action_UseFood");
+    EatFoodAction.Cost = 1;
+    EatFoodAction.Preconditions.Add(TEXT("HasFood"), 1);
+    EatFoodAction.Effects.Add(TEXT("HasFood"), 0);
+    Actions.Add(EatFoodAction);
     
     FGoapState InitialState;
     InitialState.Add(TEXT("ZombiesNearby"), 0);
     InitialState.Add(TEXT("HasWeapon"), 0);
     InitialState.Add(TEXT("HasMedkit"), 0);
+    InitialState.Add(TEXT("HasFood"), 0);
     InitialState.Add(TEXT("HouseExplored"), 0);
     InitialState.Add(TEXT("HasResources"), 0);
     InitialState.Add(TEXT("IsHealthy"), 1);
@@ -326,9 +345,24 @@ void UGoapAgentBrain::CalculateDesirability()
         }
     }
 
-    // Read inventory directly — Cast to typed item classes to identify what we have
+    // Read stamina
+    float CurrentStamina = 10.0f;
+    float MaxStamina = 10.0f;
+    if (Pawn)
+    {
+        if (UStaminaComponent* StamComp = Pawn->FindComponentByClass<UStaminaComponent>())
+        {
+            CurrentStamina = StamComp->GetCurrentStamina();
+            MaxStamina = StamComp->GetMaxStamina();
+        }
+    }
+    const float StaminaMissing = MaxStamina - CurrentStamina;
+
+    // Read inventory — identify what we have
     bool bHasMedkit = false;
     bool bHasWeapon = false;
+    bool bHasFood = false;
+    bool bHasUsableFood = false; // food whose value fits in remaining stamina (no waste)
     if (Pawn)
     {
         if (UInventoryComponent* InvComp = Pawn->FindComponentByClass<UInventoryComponent>())
@@ -336,21 +370,39 @@ void UGoapAgentBrain::CalculateDesirability()
             for (ABaseItem* Item : InvComp->GetInventory())
             {
                 if (!Item) continue;
-                if (Cast<AMedkit>(Item))  bHasMedkit = true;
-                if (Cast<AWeapon>(Item))  bHasWeapon = true;
+                if (Cast<AMedkit>(Item)) bHasMedkit = true;
+                if (Cast<AWeapon>(Item)) bHasWeapon = true;
+                if (AFood* Food = Cast<AFood>(Item))
+                {
+                    if (Food->GetValue() > 0)
+                    {
+                        bHasFood = true;
+                        if (static_cast<float>(Food->GetValue()) <= StaminaMissing)
+                            bHasUsableFood = true;
+                    }
+                }
             }
         }
     }
 
     CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
     CurrentState.Add(TEXT("HasMedkit"), bHasMedkit ? 1 : 0);
+    CurrentState.Add(TEXT("HasFood"),   bHasFood   ? 1 : 0);
     CurrentState.Add(TEXT("IsHealthy"), (CurrentHealth >= 3.0f) ? 1 : 0);
 
     
     for (FGoapGoalStrategy& Strategy : PossibleGoals)
     {
+        // Dependency for: "Eat Food"
+        if (Strategy.GoalKey == TEXT("HasFood"))
+        {
+            // Only eat when food value fits in remaining stamina — no waste.
+            // Slightly above HasResources (40) so it interrupts searching rather than waiting for a gap.
+            Strategy.DesirabilityScore = bHasUsableFood ? 45.0f : 0.0f;
+        }
+
         // Dependency for: "Survive Threats"
-        if (Strategy.GoalKey == TEXT("ZombiesNearby"))
+        else if (Strategy.GoalKey == TEXT("ZombiesNearby"))
         {
             // If zombies are in our perception field, keep this maxed out.
             // If they vanish, drop urgency to zero so we don't try to resolve a solved threat.
