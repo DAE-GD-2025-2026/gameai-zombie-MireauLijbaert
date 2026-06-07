@@ -18,8 +18,8 @@ public:
     
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-    // Initializes actions and base world-state states dynamically
-    void InitializeAgent(const TArray<FGoapAction>& CustomActions, const FGoapState& InitialState);
+    // Initializes actions, goals and base world-state states dynamically
+    void InitializeAgent(const TArray<FGoapAction>& CustomActions, const TArray<FGoapGoalStrategy>& Goals, const FGoapState& InitialState);
 
     // Determines the active goal based on highest desirability
     void ProcessHighestPriorityGoal(const TArray<FGoapGoalStrategy>& Strategies);
@@ -50,6 +50,10 @@ public:
 protected:
     UPROPERTY(BlueprintReadOnly, Category = "GOAP")
     TArray<FGoapAction> AvailableActions;
+    
+    UPROPERTY(BlueprintReadOnly, Category = "GOAP")
+    TArray<FGoapGoalStrategy> PossibleGoals;
+    
 
     UPROPERTY(BlueprintReadOnly, Category = "GOAP")
     FGoapState CurrentState;
@@ -76,4 +80,6 @@ protected:
 private:
     void FindNewPlan();
     void StartNextPlanStep();
+    void SetupGoalsAndActions();
+    void CalculateDesirability();
 };

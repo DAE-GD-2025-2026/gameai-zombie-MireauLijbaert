@@ -5,12 +5,85 @@
 UGoapAgentBrain::UGoapAgentBrain()
 {
     PrimaryComponentTick.bCanEverTick = true;
+    SetupGoalsAndActions();
 }
 
-void UGoapAgentBrain::InitializeAgent(const TArray<FGoapAction>& CustomActions, const FGoapState& InitialState)
+void UGoapAgentBrain::SetupGoalsAndActions()
+{
+    TArray<FGoapAction> Actions;
+    TArray<FGoapGoalStrategy> Goals;
+
+    // ---Define goals---
+    
+    // Priority Goal: Survival
+    FGoapGoalStrategy DefendGoal;
+    DefendGoal.GoalKey = TEXT("ZombiesNearby");
+    DefendGoal.TargetValue = 0;
+    DefendGoal.DesirabilityScore = 95.0f; // Extremely high urgency!
+    DefendGoal.VisualName = TEXT("Survive Threats");
+    Goals.Add(DefendGoal);
+
+    // Baseline Goal: Looting Houses 
+    FGoapGoalStrategy LootGoal;
+    LootGoal.GoalKey = TEXT("HasResources");
+    LootGoal.TargetValue = 1;
+    LootGoal.DesirabilityScore = 40.0f; // Default task when safe
+    LootGoal.VisualName = TEXT("Search Houses for Loot");
+    Goals.Add(LootGoal);
+
+    // Emergency Goal: Healing 
+    FGoapGoalStrategy CriticalHealGoal;
+    CriticalHealGoal.GoalKey = TEXT("IsHealthy");
+    CriticalHealGoal.TargetValue = 1;
+    CriticalHealGoal.DesirabilityScore = 0.0f; // Dynamic, We will update this via sensors
+    CriticalHealGoal.VisualName = TEXT("Heal Critical Injuries");
+    Goals.Add(CriticalHealGoal);
+
+    // ---Define actions---
+    
+    // Action Kiting Combat
+    FGoapAction KiteAction;
+    KiteAction.ActionName = TEXT("Action_Kiting");
+    KiteAction.Cost = 1;
+    KiteAction.Preconditions.Add(TEXT("ZombiesNearby"), 1);
+    KiteAction.Preconditions.Add(TEXT("HasWeapon"), 1);
+    KiteAction.Effects.Add(TEXT("ZombiesNearby"), 0); // Fleeing/killing eliminates threat
+    Actions.Add(KiteAction);
+
+    // Action Search House
+    FGoapAction SearchHouseAction;
+    SearchHouseAction.ActionName = TEXT("Action_SearchHouse");
+    SearchHouseAction.Cost = 3;
+    SearchHouseAction.Preconditions.Add(TEXT("ZombiesNearby"), 0);
+    SearchHouseAction.Effects.Add(TEXT("HouseExplored"), 1);
+    Actions.Add(SearchHouseAction);
+
+    // Action Loot Item
+    FGoapAction PickupAction;
+    PickupAction.ActionName = TEXT("Action_PickupLoot");
+    PickupAction.Cost = 1;
+    PickupAction.Preconditions.Add(TEXT("HouseExplored"), 1);
+    PickupAction.Effects.Add(TEXT("HasResources"), 1);
+    Actions.Add(PickupAction);
+
+    // Action Inject Medkit
+    FGoapAction HealAction;
+    HealAction.ActionName = TEXT("Action_UseMedkit");
+    HealAction.Cost = 2;
+    HealAction.Preconditions.Add(TEXT("HasMedkit"), 1);
+    HealAction.Effects.Add(TEXT("IsHealthy"), 1);
+    Actions.Add(HealAction);
+    
+    FGoapState InitialState; // Start blank
+    InitializeAgent(Actions, Goals, InitialState);
+    
+}
+
+void UGoapAgentBrain::InitializeAgent(const TArray<FGoapAction>& CustomActions, const TArray<FGoapGoalStrategy>& Goals, const FGoapState& InitialState)
 {
     AvailableActions = CustomActions;
     CurrentState = InitialState;
+    PossibleGoals = Goals;
     CurrentPlan.Empty();
     bIsExecutingAction = false;
     
@@ -185,4 +258,73 @@ void UGoapAgentBrain::AbortCurrentPlan()
     bIsExecutingAction = false;
     VisualCurrentActionName = TEXT("Aborted / Re-planning...");
     PlanningCooldownTimer = 0.1f; // Quick recalculation frame jump
+}
+
+// Specific to my goals
+void UGoapAgentBrain::CalculateDesirability()
+{
+   // if (!Perceptor) return;
+
+  
+    //bool bZombiesDetected = (Perceptor->PerceivedZombies.Num() > 0);
+    //CurrentState.Add(TEXT("ZombiesNearby"), bZombiesDetected ? 1 : 0);
+
+    // Grab status parameters from the teacher's pawn or components
+    // float CurrentHealth = ... Get Health ...
+    // bool bHasMedkit = ... Get Inventory Medkit Count ...
+    // bool bHasWeapon = ... Get Weapon Equipped ...
+
+    // Mock parameters for compilation safety until connected:
+    // float CurrentHealth = 100.0f; 
+    // bool bHasMedkit = false;
+    // bool bHasWeapon = true;
+    //
+    // CurrentState.Add(TEXT("HasWeapon"), bHasWeapon ? 1 : 0);
+    // CurrentState.Add(TEXT("HasMedkit"), bHasMedkit ? 1 : 0);
+    //
+    //
+    // for (FGoapGoalStrategy& Strategy : PossibleGoals)
+    // {
+    //     // Dependency for: "Survive Threats"
+    //     if (Strategy.GoalKey == TEXT("ZombiesNearby"))
+    //     {
+    //         // If zombies are in our perception field, keep this maxed out.
+    //         // If they vanish, drop urgency to zero so we don't try to resolve a solved threat.
+    //         Strategy.DesirabilityScore = bZombiesDetected ? 95.0f : 0.0f;
+    //     }
+    //
+    //     // Dependency for: "Heal Critical Injuries"
+    //     else if (Strategy.GoalKey == TEXT("IsHealthy"))
+    //     {
+    //         // If our health drops below 30% AND we possess a healing item,
+    //         // make this the single most important task in existence.
+    //         if (CurrentHealth < 30.0f && bHasMedkit)
+    //         {
+    //             Strategy.DesirabilityScore = 100.0f; 
+    //         }
+    //         else
+    //         {
+    //             Strategy.DesirabilityScore = 0.0f; // Reset if healthy or helpless
+    //         }
+    //     }
+    //
+    //     // Dependency for: "Search Houses for Loot"
+    //     else if (Strategy.GoalKey == TEXT("HasResources"))
+    //     {
+    //         // Baseline exploration task. If we are completely safe from zombies
+    //         // and don't need emergency medical care, this stays active.
+    //         if (!bZombiesDetected && CurrentHealth >= 30.0f)
+    //         {
+    //             Strategy.DesirabilityScore = 40.0f;
+    //         }
+    //         else
+    //         {
+    //             Strategy.DesirabilityScore = 10.0f; // Suppressed under duress
+    //         }
+    //     }
+    // }
+    //
+    //
+    // // Send your newly weighted goal vectors right back into your strategy sorter loop!
+    // ProcessHighestPriorityGoal(PossibleGoals);
 }
