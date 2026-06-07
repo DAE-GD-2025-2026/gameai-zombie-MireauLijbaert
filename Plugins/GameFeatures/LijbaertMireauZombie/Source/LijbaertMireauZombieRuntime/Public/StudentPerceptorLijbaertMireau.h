@@ -55,18 +55,27 @@ public:
 
 	UPROPERTY()
 	TArray<AActor*> PerceivedLoot;
+
+	UPROPERTY()
+	TArray<AActor*> PerceivedHouses;
 	
 	float GetCurrentHP() const;
 	float GetCurrentStamina() const;
 	
 	AActor* GetHighestThreatZombie();
-	AActor* GetNearestLoot(); 
+	AActor* GetNearestLoot();
+	AActor* GetNearestUnexploredHouse();
+	void MarkCurrentHouseExplored();
+	AActor* GetCurrentTargetHouse() const { return CurrentTargetHouse; }
 
 private:
 	EMovementState CurrentState = EMovementState::None;
 	bool bActionFinished = false; 
-	// Allocate your ported Reynolds math engines
+	
 	Wander* MyWanderBehavior = nullptr;
 	PathFollow* MyPathFollowBehavior = nullptr;
 	Flee*       MyFleeBehavior       = nullptr;
+	
+	TArray<AActor*> ExploredHouses;
+	AActor* CurrentTargetHouse = nullptr;
 };

@@ -4,6 +4,8 @@
 #include "NavigationSystem.h"
 #include "Kismet/GameplayStatics.h"
 #include "Navigation/PathFollowingComponent.h"
+#include "Common/InventoryComponent.h"
+#include "Items/BaseItem.h"
 
 UBTTask_ExecuteGoapAction::UBTTask_ExecuteGoapAction()
 {
@@ -38,9 +40,18 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
     }
     if (CurrentAction.ActionName == TEXT("Action_SearchHouse"))
     {
-        // Navigate toward a random nearby house tag
-        // For now: just wander until you have a house system
-        Perceptor->ActivateWanderMode();
+        // Check if we've already spotted a house we can head to
+        AActor* House = Perceptor->GetNearestUnexploredHouse();
+        if (House)
+        {
+            // We know where a house is — navigate straight to it
+            Perceptor->ActivateNavigationTarget(House->GetActorLocation());
+        }
+        else
+        {
+            // No house spotted yet — wander until AIPerception picks one up
+            Perceptor->ActivateWanderMode();
+        }
         return EBTNodeResult::InProgress;
     }
     if (CurrentAction.ActionName == TEXT("Action_PickupLoot"))
@@ -65,10 +76,73 @@ EBTNodeResult::Type UBTTask_ExecuteGoapAction::ExecuteTask(UBehaviorTreeComponen
 void UBTTask_ExecuteGoapAction::TickTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, float DeltaSeconds)
 {
     AAIController* AIC = OwnerComp.GetAIOwner();
+    if (!AIC) return;
     APawn* ControlledPawn = AIC->GetPawn();
-    UGoapAgentBrain* Brain = ControlledPawn->FindComponentByClass<UGoapAgentBrain>();
+    if (!ControlledPawn) return;
+
+    UGoapAgentBrain* Brain = AIC->FindComponentByClass<UGoapAgentBrain>();
     UStudentPerceptor* Perceptor = ControlledPawn->FindComponentByClass<UStudentPerceptor>();
-    
+    if (!Brain || !Perceptor || Brain->GetCurrentPlan().Num() == 0) return;
+
+    const FGoapAction& CurrentAction = Brain->GetCurrentPlan()[0];
+
+    // --- SearchHouse: wander until we spot a house, then navigate to it ---
+    if (CurrentAction.ActionName == TEXT("Action_SearchHouse"))
+    {
+        if (!Perceptor->IsCurrentActionFinished())
+        {
+            // If we were wandering and just spotted a house, switch to navigation
+            if (Perceptor->GetCurrentTargetHouse() == nullptr)
+            {
+                AActor* House = Perceptor->GetNearestUnexploredHouse();
+                if (House)
+                {
+                    Perceptor->ActivateNavigationTarget(House->GetActorLocation());
+                }
+            }
+            return; // Still traveling
+        }
+
+        // Arrived at the house — mark it explored and complete the action
+        Perceptor->MarkCurrentHouseExplored();
+        Brain->CompleteCurrentAction();
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        return;
+    }
+
+    // --- PickupLoot: navigate to item, then actually grab it ---
+    if (CurrentAction.ActionName == TEXT("Action_PickupLoot"))
+    {
+        if (!Perceptor->IsCurrentActionFinished()) return; // Still traveling
+
+        // Arrived near the loot — find the inventory and grab the nearest item
+        UInventoryComponent* Inv = ControlledPawn->FindComponentByClass<UInventoryComponent>();
+        AActor* LootActor = Perceptor->GetNearestLoot();
+
+        if (Inv && LootActor)
+        {
+            ABaseItem* Item = Cast<ABaseItem>(LootActor);
+            if (Item)
+            {
+                const TArray<ABaseItem*>& InvSlots = Inv->GetInventory();
+                for (int32 i = 0; i < InvSlots.Num(); ++i)
+                {
+                    if (InvSlots[i] == nullptr)
+                    {
+                        Inv->GrabItem(i, Item);
+                        UE_LOG(LogTemp, Log, TEXT("BTTask: Picked up item '%s' into slot %d"), *Item->GetName(), i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Brain->CompleteCurrentAction();
+        FinishLatentTask(OwnerComp, EBTNodeResult::Succeeded);
+        return;
+    }
+
+    // --- Default: all other actions finish when perceptor signals done ---
     if (Perceptor->IsCurrentActionFinished())
     {
         Brain->CompleteCurrentAction();

@@ -2,6 +2,11 @@
 #include "GameFramework/Character.h"
 #include "GoapAgentInterface.h"
 #include "AIController.h"
+#include "Common/InventoryComponent.h"
+#include "Common/HealthComponent.h"
+#include "Items/BaseItem.h"
+#include "Items/Medkit.h"
+#include "Items/Weapon.h"
 
 UGoapAgentBrain::UGoapAgentBrain()
 {
@@ -267,45 +272,28 @@ void UGoapAgentBrain::CalculateDesirability()
     
     APawn* Pawn = Cast<APawn>(CachedPerceptor->GetOwner());
 
-    // Read Health via reflection
+    // Read health directly via the typed component
     float CurrentHealth = 100.f;
     if (Pawn)
     {
-        if (UActorComponent* HPComp = Pawn->GetComponentByClass(
-            UClass::TryFindTypeSlow<UClass>(TEXT("/Script/GameAI_Zombie.HealthComponent"))))
+        if (UHealthComponent* HPComp = Pawn->FindComponentByClass<UHealthComponent>())
         {
-            // GetHealth() is a BlueprintPure UFUNCTION, so we can call it by name
-            struct { int32 ReturnValue; } HealthResult;
-            UFunction* GetHealthFunc = HPComp->FindFunction(FName("GetHealth"));
-            if (GetHealthFunc)
-            {
-                HPComp->ProcessEvent(GetHealthFunc, &HealthResult);
-                CurrentHealth = (float)HealthResult.ReturnValue;
-            }
+            CurrentHealth = static_cast<float>(HPComp->GetHealth());
         }
     }
 
-    // Read Inventory via reflection
+    // Read inventory directly — Cast to typed item classes to identify what we have
     bool bHasMedkit = false;
     bool bHasWeapon = false;
     if (Pawn)
     {
-        if (UActorComponent* InvComp = Pawn->GetComponentByClass(
-            UClass::TryFindTypeSlow<UClass>(TEXT("/Script/GameAI_Zombie.InventoryComponent"))))
+        if (UInventoryComponent* InvComp = Pawn->FindComponentByClass<UInventoryComponent>())
         {
-            struct { TArray<UObject*> ReturnValue; } InvResult;
-            UFunction* GetInvFunc = InvComp->FindFunction(FName("GetInventory"));
-            if (GetInvFunc)
+            for (ABaseItem* Item : InvComp->GetInventory())
             {
-                InvComp->ProcessEvent(GetInvFunc, &InvResult);
-                for (UObject* Item : InvResult.ReturnValue)
-                {
-                    if (!Item) continue;
-                    FString ClassName = Item->GetClass()->GetName();
-                    if (ClassName.Contains(TEXT("Medkit")))  bHasMedkit = true;
-                    if (ClassName.Contains(TEXT("Pistol")) || 
-                        ClassName.Contains(TEXT("Shotgun"))) bHasWeapon = true;
-                }
+                if (!Item) continue;
+                if (Cast<AMedkit>(Item))  bHasMedkit = true;
+                if (Cast<AWeapon>(Item))  bHasWeapon = true;
             }
         }
     }

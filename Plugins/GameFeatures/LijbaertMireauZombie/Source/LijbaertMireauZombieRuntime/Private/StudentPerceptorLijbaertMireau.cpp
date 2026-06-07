@@ -1,5 +1,10 @@
 ﻿#include "StudentPerceptorLijbaertMireau.h"
 
+#include "Kismet/GameplayStatics.h"
+#include "Zombies/BaseZombie.h"
+#include "Items/BaseItem.h"
+#include "Village/House/House.h"
+
 UStudentPerceptor::UStudentPerceptor()
 {
     PrimaryComponentTick.bCanEverTick = true;
@@ -160,24 +165,27 @@ void UStudentPerceptor::TickComponent(float DeltaTime, ELevelTick TickType, FAct
 
 void UStudentPerceptor::OnPerceptionUpdated(AActor* Actor, FAIStimulus Stimulus)
 {
+    
     GEngine->AddOnScreenDebugMessage(5, 1.f, FColor::Green, FString::Printf(TEXT("Saw Something!")));
     
     if (!Actor) return;
 
-    // Detect if the actor is a zombie or loot based on its class name or tags
-    bool bIsZombie = Actor->ActorHasTag(FName("Zombie")) || Actor->GetName().Contains(TEXT("Zombie"));
-    bool bIsLoot = Actor->ActorHasTag(FName("Loot")) || Actor->GetName().Contains(TEXT("Item")) || Actor->GetName().Contains(TEXT("Pickup"));
+    // Use proper type checks via Cast — no string hacking needed since we depend on GameAI_Zombie
+    const bool bIsZombie = Cast<ABaseZombie>(Actor) != nullptr;
+    const bool bIsLoot   = Cast<ABaseItem>(Actor)   != nullptr;
+    const bool bIsHouse  = Cast<AHouse>(Actor)      != nullptr;
 
     if (Stimulus.WasSuccessfullySensed())
     {
         if (bIsZombie) PerceivedZombies.AddUnique(Actor);
-        if (bIsLoot) PerceivedLoot.AddUnique(Actor);
+        if (bIsLoot)   PerceivedLoot.AddUnique(Actor);
+        if (bIsHouse)  PerceivedHouses.AddUnique(Actor);
     }
     else
     {
-        // Lost sight of them
         if (bIsZombie) PerceivedZombies.Remove(Actor);
-        if (bIsLoot) PerceivedLoot.Remove(Actor);
+        if (bIsLoot)   PerceivedLoot.Remove(Actor);
+        // Houses stay in memory even out of sight — once you see a house, you remember where it is
     }
 }
 
@@ -199,4 +207,38 @@ AActor* UStudentPerceptor::GetHighestThreatZombie()
         }
     }
     return ClosestZombie;
+}
+
+AActor* UStudentPerceptor::GetNearestUnexploredHouse()
+{
+    // Only consider houses we have actually spotted via AIPerception (limited information)
+    AActor* Nearest = nullptr;
+    float NearestDistSq = MAX_FLT;
+    FVector MyLoc = GetOwner()->GetActorLocation();
+
+    for (AActor* House : PerceivedHouses)
+    {
+        if (!House || ExploredHouses.Contains(House)) continue;
+        float DistSq = FVector::DistSquared(MyLoc, House->GetActorLocation());
+        if (DistSq < NearestDistSq)
+        {
+            NearestDistSq = DistSq;
+            Nearest = House;
+        }
+    }
+
+    // Remember which house we're heading to so MarkCurrentHouseExplored knows what to mark
+    if (Nearest)
+    {
+        CurrentTargetHouse = Nearest;
+    }
+
+    return Nearest;
+}
+
+void UStudentPerceptor::MarkCurrentHouseExplored()
+{
+    if (CurrentTargetHouse)
+        ExploredHouses.AddUnique(CurrentTargetHouse);
+    CurrentTargetHouse = nullptr;
 }

@@ -40,7 +40,7 @@ public class LijbaertMireauZombieRuntime : ModuleRules
 				"SlateCore",
 				"AIModule",
 				"NavigationSystem",
-				// ... add private dependencies that you statically link with here ...	
+				"GameAI_Zombie", // Needed to use InventoryComponent, BaseItem, House headers directly
 			}
 			);
 		
